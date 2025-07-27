@@ -16,7 +16,7 @@ class S3DataDownloader:
     def __init__(self, root):
         self.root = root
         self.root.title("S3 데이터 다운로더")
-        self.root.geometry("700x850")
+        self.root.geometry("700x1100")  # 창 높이를 더 늘림
         
         # 스타일 설정
         style = ttk.Style()
@@ -44,17 +44,17 @@ class S3DataDownloader:
     def create_ui(self):
         """UI 생성"""
         # 메인 프레임
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root, padding="5")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # 타이틀
         title_label = ttk.Label(main_frame, text="S3 데이터 다운로더", 
-                               font=('Arial', 16, 'bold'))
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+                               font=('Arial', 14, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 10))
         
         # .env 파일 로드 섹션
-        env_frame = ttk.LabelFrame(main_frame, text="환경 설정", padding="10")
-        env_frame.grid(row=1, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        env_frame = ttk.LabelFrame(main_frame, text="환경 설정", padding="5")
+        env_frame.grid(row=1, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         self.env_status = ttk.Label(env_frame, text=".env 파일이 로드되지 않았습니다.", foreground="red")
         self.env_status.grid(row=0, column=0, padx=5)
@@ -66,10 +66,10 @@ class S3DataDownloader:
         self.test_connection_button.grid(row=0, column=2, padx=5)
         
         # 데이터 타입 선택 (acc/mic)
-        type_frame = ttk.LabelFrame(main_frame, text="데이터 타입 선택", padding="10")
-        type_frame.grid(row=2, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        type_frame = ttk.LabelFrame(main_frame, text="데이터 타입 선택", padding="5")
+        type_frame.grid(row=2, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
-        ttk.Label(type_frame, text="데이터 타입:", font=('Arial', 12)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(type_frame, text="데이터 타입:", font=('Arial', 10)).grid(row=0, column=0, sticky=tk.W, pady=3)
         self.data_type_var = tk.StringVar(value="mic")
         
         data_type_frame = ttk.Frame(type_frame)
@@ -81,7 +81,7 @@ class S3DataDownloader:
                        value="acc").pack(side=tk.LEFT, padx=10)
         
         # 머신 ID 선택
-        ttk.Label(type_frame, text="머신 ID:", font=('Arial', 12)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(type_frame, text="머신 ID:", font=('Arial', 10)).grid(row=1, column=0, sticky=tk.W, pady=3)
         self.machine_var = tk.StringVar()
         machine_combo = ttk.Combobox(type_frame, textvariable=self.machine_var, width=30)
         machine_combo['values'] = ('HOTCHAMBER_M2', 'CURINGOVEN_M1')
@@ -90,8 +90,8 @@ class S3DataDownloader:
         machine_combo.set('HOTCHAMBER_M2')  # 기본값 설정
         
         # 버킷 및 경로 선택
-        path_frame = ttk.LabelFrame(main_frame, text="S3 버킷 설정", padding="10")
-        path_frame.grid(row=3, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        path_frame = ttk.LabelFrame(main_frame, text="S3 버킷 설정", padding="5")
+        path_frame.grid(row=3, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         # 버킷 선택
         ttk.Label(path_frame, text="버킷 이름:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -103,8 +103,8 @@ class S3DataDownloader:
         ttk.Button(path_frame, text="버킷 목록 불러오기", command=self.load_buckets).grid(row=0, column=2, padx=5)
         
         # 날짜 선택 프레임
-        date_frame = ttk.LabelFrame(main_frame, text="날짜 범위 선택", padding="10")
-        date_frame.grid(row=4, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        date_frame = ttk.LabelFrame(main_frame, text="날짜 범위 선택", padding="5")
+        date_frame.grid(row=4, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         # 하루치 다운로드 옵션
         self.single_day_var = tk.BooleanVar()
@@ -149,9 +149,58 @@ class S3DataDownloader:
         self.end_day_entry = ttk.Entry(self.end_frame, textvariable=self.end_day, width=4)
         self.end_day_entry.pack(side=tk.LEFT)
         
+        # 시간 범위 선택 프레임
+        time_frame = ttk.LabelFrame(main_frame, text="시간 범위 설정", padding="5")
+        time_frame.grid(row=5, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+        
+        # 시간 범위 사용 체크박스
+        self.use_time_range_var = tk.BooleanVar(value=False)
+        time_cb = ttk.Checkbutton(time_frame, text="시간 범위 지정", 
+                                  variable=self.use_time_range_var, 
+                                  command=self.toggle_time_range)
+        time_cb.grid(row=0, column=0, columnspan=3, pady=5, sticky=tk.W)
+        
+        # 시작 시간
+        ttk.Label(time_frame, text="시작 시간:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.start_hour = tk.StringVar(value="00")
+        self.start_minute = tk.StringVar(value="00")
+        
+        start_time_frame = ttk.Frame(time_frame)
+        start_time_frame.grid(row=1, column=1, sticky=tk.W)
+        
+        self.start_hour_spin = ttk.Spinbox(start_time_frame, from_=0, to=23, width=3, 
+                                          textvariable=self.start_hour, format="%02.0f")
+        self.start_hour_spin.pack(side=tk.LEFT)
+        ttk.Label(start_time_frame, text=":").pack(side=tk.LEFT)
+        self.start_minute_spin = ttk.Spinbox(start_time_frame, from_=0, to=59, width=3,
+                                            textvariable=self.start_minute, format="%02.0f")
+        self.start_minute_spin.pack(side=tk.LEFT)
+        
+        # 종료 시간
+        ttk.Label(time_frame, text="종료 시간:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.end_hour = tk.StringVar(value="23")
+        self.end_minute = tk.StringVar(value="59")
+        
+        end_time_frame = ttk.Frame(time_frame)
+        end_time_frame.grid(row=2, column=1, sticky=tk.W)
+        
+        self.end_hour_spin = ttk.Spinbox(end_time_frame, from_=0, to=23, width=3,
+                                        textvariable=self.end_hour, format="%02.0f")
+        self.end_hour_spin.pack(side=tk.LEFT)
+        ttk.Label(end_time_frame, text=":").pack(side=tk.LEFT)
+        self.end_minute_spin = ttk.Spinbox(end_time_frame, from_=0, to=59, width=3,
+                                          textvariable=self.end_minute, format="%02.0f")
+        self.end_minute_spin.pack(side=tk.LEFT)
+        
+        # 중복 파일 건너뛰기 옵션
+        self.skip_existing_var = tk.BooleanVar(value=True)
+        skip_cb = ttk.Checkbutton(time_frame, text="이미 존재하는 파일 건너뛰기",
+                                  variable=self.skip_existing_var)
+        skip_cb.grid(row=3, column=0, columnspan=3, pady=5, sticky=tk.W)
+        
         # 저장 경로 섹션
-        save_frame = ttk.LabelFrame(main_frame, text="저장 위치", padding="10")
-        save_frame.grid(row=5, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        save_frame = ttk.LabelFrame(main_frame, text="저장 위치", padding="5")
+        save_frame.grid(row=6, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         self.save_path_var = tk.StringVar(value=self.base_save_path)
         save_path_entry = ttk.Entry(save_frame, textvariable=self.save_path_var, width=50, state='readonly')
@@ -165,8 +214,8 @@ class S3DataDownloader:
                  font=('Arial', 9, 'italic')).grid(row=2, column=0, columnspan=2, pady=2)
         
         # 다운로드 설정 프레임
-        settings_frame = ttk.LabelFrame(main_frame, text="다운로드 설정", padding="10")
-        settings_frame.grid(row=6, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        settings_frame = ttk.LabelFrame(main_frame, text="다운로드 설정", padding="5")
+        settings_frame.grid(row=7, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         ttk.Label(settings_frame, text="동시 다운로드 수:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.workers_var = tk.IntVar(value=10)
@@ -177,7 +226,7 @@ class S3DataDownloader:
         
         # 진행 상황
         progress_frame = ttk.Frame(main_frame)
-        progress_frame.grid(row=7, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E))
+        progress_frame.grid(row=8, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         self.progress = ttk.Progressbar(progress_frame, length=600, mode='determinate')
         self.progress.pack(fill=tk.X, pady=5)
@@ -186,10 +235,10 @@ class S3DataDownloader:
         self.status_label.pack(pady=5)
         
         # 로그 영역
-        log_frame = ttk.LabelFrame(main_frame, text="진행 로그", padding="10")
-        log_frame.grid(row=8, column=0, columnspan=3, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_frame = ttk.LabelFrame(main_frame, text="진행 로그", padding="5")
+        log_frame.grid(row=9, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        self.log_text = tk.Text(log_frame, height=6, width=70, state='disabled')
+        self.log_text = tk.Text(log_frame, height=4, width=70, state='disabled')
         log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
         
@@ -198,7 +247,7 @@ class S3DataDownloader:
         
         # 버튼 프레임
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=9, column=0, columnspan=3, pady=20)
+        button_frame.grid(row=10, column=0, columnspan=3, pady=30)
         
         self.download_button = ttk.Button(button_frame, text="다운로드 시작", 
                                         command=self.start_download, width=20, padding="10")
@@ -211,12 +260,15 @@ class S3DataDownloader:
         
         # 컬럼/행 설정
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(8, weight=1)
+        main_frame.rowconfigure(9, weight=1)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         
         # 초기 로그 메시지
         self.log(f"저장 경로 설정: {self.base_save_path}")
+        
+        # 초기 상태 설정
+        self.toggle_time_range()
     
     def toggle_single_day(self):
         """하루치 다운로드 선택 시 종료일 입력 비활성화"""
@@ -232,6 +284,16 @@ class S3DataDownloader:
             # 종료일 입력 활성화
             self.end_label.grid(row=2, column=0, sticky=tk.W, pady=5)
             self.end_frame.grid(row=2, column=1, sticky=tk.W)
+    
+    def toggle_time_range(self):
+        """시간 범위 사용 여부에 따라 시간 입력 필드 활성화/비활성화"""
+        enabled = self.use_time_range_var.get()
+        state = 'normal' if enabled else 'disabled'
+        
+        self.start_hour_spin.config(state=state)
+        self.start_minute_spin.config(state=state)
+        self.end_hour_spin.config(state=state)
+        self.end_minute_spin.config(state=state)
     
     def load_env_file(self):
         """환경 변수 파일 선택 및 로드"""
@@ -415,6 +477,31 @@ class S3DataDownloader:
         except Exception as e:
             return {'success': False, 'key': key, 'error': str(e)}
     
+    def is_file_in_time_range(self, filename, start_hour, start_minute, end_hour, end_minute):
+        """파일명에서 시간을 추출하여 지정된 시간 범위 내에 있는지 확인"""
+        try:
+            # 파일명 형식: YYYYMMDD_HH_MM_SS_...
+            parts = filename.split('_')
+            if len(parts) >= 4:
+                hour = int(parts[1])
+                minute = int(parts[2])
+                
+                # 파일 시간을 분 단위로 변환
+                file_minutes = hour * 60 + minute
+                start_minutes = start_hour * 60 + start_minute
+                end_minutes = end_hour * 60 + end_minute
+                
+                # 시간 범위 체크
+                if start_minutes <= end_minutes:
+                    # 일반적인 경우 (같은 날 내)
+                    return start_minutes <= file_minutes <= end_minutes
+                else:
+                    # 자정을 넘어가는 경우 (예: 22:00 ~ 02:00)
+                    return file_minutes >= start_minutes or file_minutes <= end_minutes
+        except:
+            pass
+        return True  # 파싱 실패 시 포함
+    
     def download_files_parallel(self, dat_files, date_folder, current_date):
         """병렬로 파일 다운로드"""
         # 다운로드 작업 준비
@@ -424,11 +511,31 @@ class S3DataDownloader:
             file_name = os.path.basename(file_key)
             local_path = os.path.join(date_folder, file_name)
             
-            download_tasks.append({
-                'bucket': self.bucket_var.get(),
-                'key': file_key,
-                'local_path': local_path
-            })
+            # 시간 범위 체크
+            should_download = True
+            if self.use_time_range_var.get():
+                start_hour = int(self.start_hour.get())
+                start_minute = int(self.start_minute.get())
+                end_hour = int(self.end_hour.get())
+                end_minute = int(self.end_minute.get())
+                
+                if not self.is_file_in_time_range(file_name, start_hour, start_minute, end_hour, end_minute):
+                    should_download = False
+            
+            # 중복 파일 체크
+            if should_download and self.skip_existing_var.get() and os.path.exists(local_path):
+                self.log(f"  ⏭️ 스킵 (이미 존재): {file_name}")
+                should_download = False
+            
+            if should_download:
+                download_tasks.append({
+                    'bucket': self.bucket_var.get(),
+                    'key': file_key,
+                    'local_path': local_path
+                })
+        
+        if not download_tasks:
+            return 0, 0, 0, 0
         
         # 멀티스레딩으로 다운로드
         downloaded_count = 0
@@ -514,6 +621,15 @@ class S3DataDownloader:
             # 데이터 타입과 머신 ID 가져오기
             data_type = self.data_type_var.get()
             machine_id = self.machine_var.get()
+            
+            # 시간 범위 설정 로그
+            if self.use_time_range_var.get():
+                time_range_str = f"{self.start_hour.get()}:{self.start_minute.get()} ~ {self.end_hour.get()}:{self.end_minute.get()}"
+                self.log(f"시간 범위: {time_range_str}")
+            else:
+                self.log("시간 범위: 전체")
+                
+            self.log(f"중복 파일 건너뛰기: {'예' if self.skip_existing_var.get() else '아니오'}")
             
             while current_date <= end_date:
                 # S3 경로 생성: {machine_id}/raw_dat/{data_type}/{YYYYMMDD}_로 시작하는 모든 파일

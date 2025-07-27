@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# large_csv_plotter.py - 대용량 CSV 파일 시각화 도구
+# large_csv_plotter.py - 대용량 CSV 파일 시각화 도구 (30분 단위 시간축)
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import sys
@@ -13,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QButtonGroup, QSlider, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import gc
-from datetime import datetime
+from datetime import datetime, timedelta
 
 class DataLoader(QThread):
     """백그라운드에서 데이터를 로드하는 스레드"""
@@ -115,6 +116,23 @@ class PlotCanvas(FigureCanvas):
         self.fig.tight_layout()
         self.draw()
     
+    def _setup_time_axis(self, ax, has_timestamp=False):
+        """시간 축 포맷 설정 - 30분 단위"""
+        if has_timestamp:
+            # 30분 간격으로 주 눈금 설정
+            ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+            # 15분 간격으로 보조 눈금 설정
+            ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+            # 시간 포맷 설정 (시:분)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            
+            # x축 라벨 회전
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # 그리드 설정
+            ax.grid(True, which='major', alpha=0.5)
+            ax.grid(True, which='minor', alpha=0.2, linestyle=':')
+    
     def _plot_acc_data(self, df, plot_type, time_range=None):
         """가속도계 데이터 플롯"""
         # 시간 범위 필터링
@@ -130,7 +148,9 @@ class PlotCanvas(FigureCanvas):
             ax2 = self.fig.add_subplot(312, sharex=ax1)
             ax3 = self.fig.add_subplot(313, sharex=ax1)
             
-            if 'timestamp' in df_plot.columns:
+            has_timestamp = 'timestamp' in df_plot.columns
+            
+            if has_timestamp:
                 x_data = df_plot['timestamp']
                 ax3.set_xlabel('Time')
             else:
@@ -139,24 +159,31 @@ class PlotCanvas(FigureCanvas):
             
             ax1.plot(x_data, df_plot['x'], 'b-', linewidth=0.5)
             ax1.set_ylabel('X-axis (g)')
-            ax1.grid(True, alpha=0.3)
             
             ax2.plot(x_data, df_plot['y'], 'g-', linewidth=0.5)
             ax2.set_ylabel('Y-axis (g)')
-            ax2.grid(True, alpha=0.3)
             
             ax3.plot(x_data, df_plot['z'], 'r-', linewidth=0.5)
             ax3.set_ylabel('Z-axis (g)')
-            ax3.grid(True, alpha=0.3)
             
             ax1.set_title('Accelerometer Data')
+            
+            # 모든 축에 시간 포맷 적용
+            for ax in [ax1, ax2, ax3]:
+                self._setup_time_axis(ax, has_timestamp)
+            
+            # x축 라벨은 마지막 subplot에만 표시
+            plt.setp(ax1.xaxis.get_majorticklabels(), visible=False)
+            plt.setp(ax2.xaxis.get_majorticklabels(), visible=False)
             
         elif plot_type == 'magnitude':
             # 진폭 플롯
             ax = self.fig.add_subplot(111)
             magnitude = np.sqrt(df_plot['x']**2 + df_plot['y']**2 + df_plot['z']**2)
             
-            if 'timestamp' in df_plot.columns:
+            has_timestamp = 'timestamp' in df_plot.columns
+            
+            if has_timestamp:
                 ax.plot(df_plot['timestamp'], magnitude, 'k-', linewidth=0.5)
                 ax.set_xlabel('Time')
             else:
@@ -165,7 +192,9 @@ class PlotCanvas(FigureCanvas):
             
             ax.set_ylabel('Magnitude (g)')
             ax.set_title('Accelerometer Magnitude')
-            ax.grid(True, alpha=0.3)
+            
+            # 시간 축 포맷 적용
+            self._setup_time_axis(ax, has_timestamp)
             
         elif plot_type == 'spectrum':
             # 주파수 스펙트럼
@@ -201,7 +230,9 @@ class PlotCanvas(FigureCanvas):
             # 시계열 플롯
             ax = self.fig.add_subplot(111)
             
-            if 'timestamp' in df_plot.columns:
+            has_timestamp = 'timestamp' in df_plot.columns
+            
+            if has_timestamp:
                 ax.plot(df_plot['timestamp'], df_plot['mic_value'], 'b-', linewidth=0.5)
                 ax.set_xlabel('Time')
             else:
@@ -210,7 +241,9 @@ class PlotCanvas(FigureCanvas):
             
             ax.set_ylabel('Amplitude')
             ax.set_title('Microphone Data')
-            ax.grid(True, alpha=0.3)
+            
+            # 시간 축 포맷 적용
+            self._setup_time_axis(ax, has_timestamp)
             
         elif plot_type == 'spectrum':
             # 주파수 스펙트럼
@@ -244,9 +277,27 @@ class PlotCanvas(FigureCanvas):
             # 로그 스케일로 변환
             Sxx_db = 10 * np.log10(Sxx + 1e-10)
             
-            im = ax.pcolormesh(t, f, Sxx_db, shading='gouraud', cmap='viridis')
+            # 시간 축을 timestamp로 변환 (있는 경우)
+            if 'timestamp' in df_plot.columns:
+                # 시작 시간
+                start_time = df_plot['timestamp'].iloc[0]
+                # 시간 배열을 datetime으로 변환
+                time_stamps = [start_time + timedelta(seconds=float(t_val)) for t_val in t]
+                
+                im = ax.pcolormesh(mdates.date2num(time_stamps), f, Sxx_db, 
+                                  shading='gouraud', cmap='viridis')
+                
+                # 시간 축 포맷 적용
+                ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+                ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                ax.set_xlabel('Time')
+            else:
+                im = ax.pcolormesh(t, f, Sxx_db, shading='gouraud', cmap='viridis')
+                ax.set_xlabel('Time (s)')
+            
             ax.set_ylabel('Frequency (Hz)')
-            ax.set_xlabel('Time (s)')
             ax.set_title('Microphone Spectrogram')
             ax.set_ylim(0, 4000)
             
@@ -258,7 +309,7 @@ class PlotCanvas(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("대용량 CSV 파일 플로터")
+        self.setWindowTitle("대용량 CSV 파일 플로터 - 30분 단위 시간축")
         self.setGeometry(100, 100, 1400, 900)
         
         # 데이터 저장
@@ -362,6 +413,14 @@ class MainWindow(QMainWindow):
         info_text += f"로드된 행: {metadata['loaded_rows']:,} | "
         if metadata['downsample_rate'] > 1:
             info_text += f"다운샘플링: 1/{metadata['downsample_rate']}"
+        
+        # 시간 범위 정보 추가
+        if 'timestamp' in df.columns:
+            start_time = df['timestamp'].min()
+            end_time = df['timestamp'].max()
+            duration = end_time - start_time
+            info_text += f" | 시간 범위: {start_time.strftime('%H:%M')} ~ {end_time.strftime('%H:%M')} ({duration})"
+        
         self.info_label.setText(info_text)
         
         # 플롯 타입 업데이트
@@ -426,6 +485,15 @@ class QuickPlotter:
         # 데이터 로드
         df = pd.read_csv(file_path)
         
+        # timestamp 변환
+        has_timestamp = False
+        if 'timestamp' in df.columns:
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                has_timestamp = True
+            except:
+                pass
+        
         # 다운샘플링
         if len(df) > max_points:
             step = len(df) // max_points
@@ -436,26 +504,52 @@ class QuickPlotter:
             # ACC 데이터
             fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
             
-            axes[0].plot(df.index, df['x'], 'b-', linewidth=0.5)
+            x_data = df['timestamp'] if has_timestamp else df.index
+            
+            axes[0].plot(x_data, df['x'], 'b-', linewidth=0.5)
             axes[0].set_ylabel('X (g)')
             axes[0].grid(True, alpha=0.3)
             
-            axes[1].plot(df.index, df['y'], 'g-', linewidth=0.5)
+            axes[1].plot(x_data, df['y'], 'g-', linewidth=0.5)
             axes[1].set_ylabel('Y (g)')
             axes[1].grid(True, alpha=0.3)
             
-            axes[2].plot(df.index, df['z'], 'r-', linewidth=0.5)
+            axes[2].plot(x_data, df['z'], 'r-', linewidth=0.5)
             axes[2].set_ylabel('Z (g)')
-            axes[2].set_xlabel('Sample')
             axes[2].grid(True, alpha=0.3)
+            
+            if has_timestamp:
+                axes[2].set_xlabel('Time')
+                # 30분 간격 설정
+                for ax in axes:
+                    ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+                    ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                
+                # x축 라벨 회전
+                plt.setp(axes[2].xaxis.get_majorticklabels(), rotation=45, ha='right')
+            else:
+                axes[2].set_xlabel('Sample')
             
             plt.suptitle('Accelerometer Data')
             
         elif 'mic_value' in df.columns:
             # MIC 데이터
             fig, ax = plt.subplots(figsize=(12, 6))
-            ax.plot(df.index, df['mic_value'], 'b-', linewidth=0.5)
-            ax.set_xlabel('Sample')
+            
+            x_data = df['timestamp'] if has_timestamp else df.index
+            ax.plot(x_data, df['mic_value'], 'b-', linewidth=0.5)
+            
+            if has_timestamp:
+                ax.set_xlabel('Time')
+                # 30분 간격 설정
+                ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+                ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            else:
+                ax.set_xlabel('Sample')
+            
             ax.set_ylabel('Amplitude')
             ax.set_title('Microphone Data')
             ax.grid(True, alpha=0.3)
@@ -494,7 +588,12 @@ class QuickPlotter:
             ax.set_ylabel('Acceleration (g)')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            plt.xticks(rotation=45)
+            
+            # 30분 간격 설정
+            ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+            ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
         
         plt.tight_layout()
         plt.show()
