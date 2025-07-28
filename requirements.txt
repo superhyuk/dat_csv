@@ -1,4 +1,5 @@
 boto3
 psycopg2-binary
 numpy
-python-dotenv
+python-dotenv   
+psutil==5.9.8

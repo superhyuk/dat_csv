@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import pandas as pd
 from psycopg2.extras import execute_values
+from collections import deque
+import logging
 
 class S3ToTimescaleDBApp:
     def __init__(self, root):
@@ -32,8 +34,6 @@ class S3ToTimescaleDBApp:
         # 변수 초기화
         self.s3_client = None
         self.db_pool = None
-        self.normal_periods = []
-        self.anomaly_periods = []
         self.is_processing = False
         
         # 배치 처리 설정
@@ -41,21 +41,55 @@ class S3ToTimescaleDBApp:
         self.file_batch_size = 1000  # 한 번에 처리할 파일 수
         self.commit_interval = 500  # 커밋 간격 (파일 수)
         self.max_workers = 20  # 동시 처리 워커 수
+        self.verbose_logging = False  # 상세 로그 on/off
         
         # 통계 정보
         self.stats = {'processed_files': 0, 'total_records': 0, 'start_time': None}
-        self.stats['acc_normal'] = 0
-        self.stats['acc_anomaly'] = 0
-        self.stats['mic_normal'] = 0
-        self.stats['mic_anomaly'] = 0
+        
+        # 로깅 시스템 초기화
+        self.setup_logging()
+        
+        # 로그 큐 및 버퍼 설정
+        self.log_queue = queue.Queue()
+        self.log_buffer = deque(maxlen=1000)  # 최대 1000줄만 유지
+        self.last_log_update = time.time()
         
         # UI 생성
-        self.create_widgets()
+        self.create_ui()
+        
+        # 로그 업데이트 타이머 시작
+        self.update_log_display()
         
         # 환경 변수 로드
         load_dotenv()
         
-    def create_widgets(self):
+    def setup_logging(self):
+        """파일 및 콘솔 로깅 설정"""
+        # 로그 디렉토리 생성
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 로그 파일명 (타임스탬프 포함)
+        log_filename = os.path.join(log_dir, f"s3_to_timescale_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        
+        # 로거 설정
+        self.logger = logging.getLogger("S3ToTimescaleDB")
+        self.logger.setLevel(logging.INFO)
+        
+        # 파일 핸들러
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        # 콘솔 핸들러
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        
+        self.log_filename = log_filename
+        
+    def create_ui(self):
         # 메인 프레임
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -161,65 +195,40 @@ class S3ToTimescaleDBApp:
                                         textvariable=self.file_batch_var, width=10)
         file_batch_spinbox.grid(row=1, column=5, padx=5)
         
+        # 로그 상세도 체크박스 추가
+        self.verbose_log_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(machine_frame, text="상세 로그", variable=self.verbose_log_var,
+                       command=self.toggle_verbose_logging).grid(row=1, column=6, padx=5)
+        
     def create_period_section(self, parent):
         # 기간 설정 프레임
-        period_frame = ttk.LabelFrame(parent, text="기간 설정", padding="5")
+        period_frame = ttk.LabelFrame(parent, text="날짜 범위 설정", padding="5")
         period_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
-        # 정상 기간 프레임
-        normal_frame = ttk.Frame(period_frame)
-        normal_frame.grid(row=0, column=0, padx=10, sticky=(tk.W, tk.E))
+        # 날짜 범위 입력
+        date_frame = ttk.Frame(period_frame)
+        date_frame.grid(row=0, column=0, padx=10, sticky=(tk.W, tk.E))
         
-        ttk.Label(normal_frame, text="정상 기간:", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=4, sticky=tk.W)
+        ttk.Label(date_frame, text="시작일:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.start_date = ttk.Entry(date_frame, width=12)
+        self.start_date.grid(row=0, column=1, padx=5)
+        self.start_date.insert(0, (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"))
         
-        # 정상 기간 입력
-        ttk.Label(normal_frame, text="시작일:").grid(row=1, column=0, sticky=tk.W)
-        self.normal_start = ttk.Entry(normal_frame, width=12)
-        self.normal_start.grid(row=1, column=1, padx=5)
-        self.normal_start.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        ttk.Label(date_frame, text="종료일:").grid(row=0, column=2, sticky=tk.W, padx=5)
+        self.end_date = ttk.Entry(date_frame, width=12)
+        self.end_date.grid(row=0, column=3, padx=5)
+        self.end_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
         
-        ttk.Label(normal_frame, text="종료일:").grid(row=1, column=2, sticky=tk.W)
-        self.normal_end = ttk.Entry(normal_frame, width=12)
-        self.normal_end.grid(row=1, column=3, padx=5)
-        self.normal_end.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        
-        ttk.Button(normal_frame, text="추가", command=self.add_normal_period).grid(row=1, column=4, padx=5)
-        
-        # 정상 기간 목록
-        self.normal_listbox = tk.Listbox(normal_frame, height=4, width=50)
-        self.normal_listbox.grid(row=2, column=0, columnspan=5, pady=5)
-        ttk.Button(normal_frame, text="선택 삭제", command=self.delete_normal_period).grid(row=3, column=0, columnspan=5)
-        
-        # 비정상 기간 프레임
-        anomaly_frame = ttk.Frame(period_frame)
-        anomaly_frame.grid(row=0, column=1, padx=10, sticky=(tk.W, tk.E))
-        
-        ttk.Label(anomaly_frame, text="비정상 기간:", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=4, sticky=tk.W)
-        
-        # 비정상 기간 입력
-        ttk.Label(anomaly_frame, text="시작일:").grid(row=1, column=0, sticky=tk.W)
-        self.anomaly_start = ttk.Entry(anomaly_frame, width=12)
-        self.anomaly_start.grid(row=1, column=1, padx=5)
-        self.anomaly_start.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        
-        ttk.Label(anomaly_frame, text="종료일:").grid(row=1, column=2, sticky=tk.W)
-        self.anomaly_end = ttk.Entry(anomaly_frame, width=12)
-        self.anomaly_end.grid(row=1, column=3, padx=5)
-        self.anomaly_end.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        
-        ttk.Button(anomaly_frame, text="추가", command=self.add_anomaly_period).grid(row=1, column=4, padx=5)
-        
-        # 비정상 기간 목록
-        self.anomaly_listbox = tk.Listbox(anomaly_frame, height=4, width=50)
-        self.anomaly_listbox.grid(row=2, column=0, columnspan=5, pady=5)
-        ttk.Button(anomaly_frame, text="선택 삭제", command=self.delete_anomaly_period).grid(row=3, column=0, columnspan=5)
+        # 선택된 날짜 범위 표시
+        self.date_range_label = ttk.Label(date_frame, text="", font=('Arial', 9, 'italic'))
+        self.date_range_label.grid(row=1, column=0, columnspan=4, pady=10)
         
     def create_action_section(self, parent):
         # 실행 버튼 프레임
         action_frame = ttk.Frame(parent)
         action_frame.grid(row=3, column=0, columnspan=2, pady=10)
         
-        self.process_btn = ttk.Button(action_frame, text="처리 시작", command=self.start_processing, 
+        self.process_btn = ttk.Button(action_frame, text="데이터 가져오기", command=self.start_processing, 
                                      style='Accent.TButton', padding=(20, 10))
         self.process_btn.pack(side=tk.LEFT, padx=5)
         
@@ -232,28 +241,46 @@ class S3ToTimescaleDBApp:
         progress_frame = ttk.LabelFrame(parent, text="진행 상황", padding="5")
         progress_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
+        # 로그 컨트롤 프레임
+        log_control_frame = ttk.Frame(progress_frame)
+        log_control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(log_control_frame, text=f"로그 파일: {getattr(self, 'log_filename', 'N/A')}").pack(side=tk.LEFT, padx=5)
+        ttk.Button(log_control_frame, text="로그 지우기", command=self.clear_log_display).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(log_control_frame, text="로그 복사", command=self.copy_log).pack(side=tk.RIGHT, padx=5)
+        
+        # 자동 스크롤 체크박스
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(log_control_frame, text="자동 스크롤", variable=self.auto_scroll_var).pack(side=tk.RIGHT, padx=5)
+        
         # 진행률 바
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.progress_bar.grid(row=1, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
         
         # 상태 레이블
         self.status_label = ttk.Label(progress_frame, text="대기 중...")
-        self.status_label.grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.status_label.grid(row=2, column=0, sticky=tk.W, padx=5)
         
         # 통계 정보 레이블 추가
         self.stats_label = ttk.Label(progress_frame, text="")
-        self.stats_label.grid(row=2, column=0, sticky=tk.W, padx=5)
+        self.stats_label.grid(row=3, column=0, sticky=tk.W, padx=5)
         
         # 예상 시간 레이블
         self.eta_label = ttk.Label(progress_frame, text="")
-        self.eta_label.grid(row=3, column=0, sticky=tk.W, padx=5)
+        self.eta_label.grid(row=4, column=0, sticky=tk.W, padx=5)
         
         # 로그 텍스트
-        self.log_text = scrolledtext.ScrolledText(progress_frame, height=10, width=80)
-        self.log_text.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        self.log_text = scrolledtext.ScrolledText(progress_frame, height=10, width=80, wrap=tk.WORD)
+        self.log_text.grid(row=5, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
-        progress_frame.rowconfigure(4, weight=1)
+        # 텍스트 태그 설정
+        self.log_text.tag_config("INFO", foreground="black")
+        self.log_text.tag_config("WARNING", foreground="orange")
+        self.log_text.tag_config("ERROR", foreground="red")
+        self.log_text.tag_config("SUCCESS", foreground="green")
+        
+        progress_frame.rowconfigure(5, weight=1)
         
     def test_connections(self):
         """AWS S3 및 TimescaleDB 연결 테스트"""
@@ -341,64 +368,89 @@ class S3ToTimescaleDBApp:
         self.bucket_var.set(os.getenv('S3_BUCKET', 'vtnnbl'))
         self.log("환경 변수 값 새로고침 완료")
     
-    def add_normal_period(self):
-        """정상 기간 추가"""
-        try:
-            start = datetime.strptime(self.normal_start.get(), "%Y-%m-%d")
-            end = datetime.strptime(self.normal_end.get(), "%Y-%m-%d")
-            if start > end:
-                messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
-                return
-            
-            period = {"start": start, "end": end}
-            self.normal_periods.append(period)
-            self.normal_listbox.insert(tk.END, f"{start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}")
-            self.log(f"정상 기간 추가: {start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}")
-            
-        except ValueError:
-            messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
+    def toggle_verbose_logging(self):
+        """상세 로그 토글"""
+        self.verbose_logging = self.verbose_log_var.get()
     
-    def add_anomaly_period(self):
-        """비정상 기간 추가"""
-        try:
-            start = datetime.strptime(self.anomaly_start.get(), "%Y-%m-%d")
-            end = datetime.strptime(self.anomaly_end.get(), "%Y-%m-%d")
-            if start > end:
-                messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
-                return
-            
-            period = {"start": start, "end": end}
-            self.anomaly_periods.append(period)
-            self.anomaly_listbox.insert(tk.END, f"{start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}")
-            self.log(f"비정상 기간 추가: {start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')}")
-            
-        except ValueError:
-            messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
-    
-    def delete_normal_period(self):
-        """선택된 정상 기간 삭제"""
-        selection = self.normal_listbox.curselection()
-        if selection:
-            index = selection[0]
-            self.normal_listbox.delete(index)
-            del self.normal_periods[index]
-            self.log("정상 기간 삭제됨")
-    
-    def delete_anomaly_period(self):
-        """선택된 비정상 기간 삭제"""
-        selection = self.anomaly_listbox.curselection()
-        if selection:
-            index = selection[0]
-            self.anomaly_listbox.delete(index)
-            del self.anomaly_periods[index]
-            self.log("비정상 기간 삭제됨")
-    
-    def log(self, message):
-        """로그 메시지 추가"""
+    def log(self, message, level="INFO"):
+        """로그 메시지 추가 (큐에 추가)"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
+        formatted_message = f"[{timestamp}] {message}"
+        
+        # 파일 및 콘솔 로깅
+        if level == "ERROR":
+            self.logger.error(message)
+        elif level == "WARNING":
+            self.logger.warning(message)
+        else:
+            self.logger.info(message)
+        
+        # GUI 로그 큐에 추가
+        try:
+            self.log_queue.put_nowait((formatted_message, level))
+        except queue.Full:
+            pass  # 큐가 가득 찬 경우 무시
+    
+    def update_log_display(self):
+        """로그 디스플레이 업데이트 (100ms마다)"""
+        try:
+            # 큐에서 메시지 가져오기 (최대 50개씩)
+            messages_to_add = []
+            for _ in range(50):
+                try:
+                    message, level = self.log_queue.get_nowait()
+                    messages_to_add.append((message, level))
+                    self.log_buffer.append(message)  # 버퍼에도 추가
+                except queue.Empty:
+                    break
+            
+            # 메시지가 있으면 텍스트 위젯에 추가
+            if messages_to_add:
+                # 현재 스크롤 위치 저장
+                current_pos = self.log_text.yview()
+                
+                for message, level in messages_to_add:
+                    self.log_text.insert(tk.END, message + "\n", level)
+                
+                # 텍스트가 너무 길면 오래된 내용 삭제
+                line_count = int(self.log_text.index('end-1c').split('.')[0])
+                if line_count > 1000:
+                    self.log_text.delete('1.0', f'{line_count-800}.0')
+                
+                # 자동 스크롤이 켜져 있으면 맨 아래로
+                if self.auto_scroll_var.get():
+                    self.log_text.see(tk.END)
+                else:
+                    # 원래 위치 복원
+                    self.log_text.yview_moveto(current_pos[0])
+        
+        except Exception as e:
+            print(f"로그 업데이트 오류: {e}")
+        
+        # 100ms 후에 다시 실행
+        self.root.after(100, self.update_log_display)
+    
+    def clear_log_display(self):
+        """로그 디스플레이 지우기"""
+        self.log_text.delete('1.0', tk.END)
+        self.log_buffer.clear()
+        # 큐 비우기
+        while not self.log_queue.empty():
+            try:
+                self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+    
+    def copy_log(self):
+        """로그 복사"""
+        try:
+            # 현재 표시된 로그 텍스트 가져오기
+            log_content = self.log_text.get('1.0', tk.END)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(log_content)
+            messagebox.showinfo("복사 완료", "로그가 클립보드에 복사되었습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", f"로그 복사 중 오류 발생: {str(e)}")
     
     def parse_filename_date(self, filename):
         """파일명에서 날짜 추출"""
@@ -417,23 +469,6 @@ class S3ToTimescaleDBApp:
             return datetime(year, month, day, hour, minute, second)
         return None
     
-    def is_in_period(self, date, periods):
-        """날짜가 지정된 기간들 중 하나에 포함되는지 확인"""
-        # date가 datetime 객체인 경우 date()로 변환
-        if isinstance(date, datetime):
-            date_only = date.date()
-        else:
-            date_only = date
-            
-        for period in periods:
-            # period의 start와 end도 date 객체로 변환
-            start_date = period['start'].date() if isinstance(period['start'], datetime) else period['start']
-            end_date = period['end'].date() if isinstance(period['end'], datetime) else period['end']
-            
-            if start_date <= date_only <= end_date:
-                return True
-        return False
-    
     def create_tables(self):
         """TimescaleDB 테이블 생성"""
         conn = self.db_pool.getconn()
@@ -443,7 +478,7 @@ class S3ToTimescaleDBApp:
             # TimescaleDB extension 활성화
             cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
         
-            # 정상 ACC 테이블
+            # ACC 테이블
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS normal_acc_data (
                     time TIMESTAMPTZ NOT NULL,
@@ -455,7 +490,7 @@ class S3ToTimescaleDBApp:
                 );
             """)
         
-            # 정상 MIC 테이블
+            # MIC 테이블
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS normal_mic_data (
                     time TIMESTAMPTZ NOT NULL,
@@ -465,30 +500,8 @@ class S3ToTimescaleDBApp:
                 );
             """)
         
-            # 비정상 ACC 테이블
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS anomaly_acc_data (
-                    time TIMESTAMPTZ NOT NULL,
-                    machine_id TEXT NOT NULL,
-                    x DOUBLE PRECISION,
-                    y DOUBLE PRECISION,
-                    z DOUBLE PRECISION,
-                    filename TEXT
-                );
-            """)
-        
-            # 비정상 MIC 테이블
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS anomaly_mic_data (
-                    time TIMESTAMPTZ NOT NULL,
-                    machine_id TEXT NOT NULL,
-                    mic_value INTEGER,
-                    filename TEXT
-                );
-            """)
-        
             # 하이퍼테이블로 변환
-            tables = ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']
+            tables = ['normal_acc_data', 'normal_mic_data']
             for table in tables:
                 try:
                     # 청크 크기를 30일로 설정
@@ -527,10 +540,11 @@ class S3ToTimescaleDBApp:
         
         # 각 세트는 3000개 int16 (6000바이트) + 8바이트 스킵 = 6008바이트
         sets = file_size // 6008
-        samples = sets * 1000
+        total_samples = sets * 1000
         
-        data = np.empty((samples, 3), dtype=np.float64)
-        total = 0
+        # 전체 데이터를 먼저 읽기
+        all_data = np.empty((total_samples, 3), dtype=np.float64)
+        read_count = 0
         
         for i in range(sets):
             # 3000개 int16 읽기
@@ -541,14 +555,29 @@ class S3ToTimescaleDBApp:
             chunk = np.frombuffer(chunk_bytes, dtype=np.int16)
             chunk_data = chunk.reshape(-1, 3)
             
-            csize = min(1000, samples - total)
-            data[total:total+csize, :] = chunk_data[:csize, :].astype(np.float64) * 0.000488
-            total += csize
+            csize = min(1000, total_samples - read_count)
+            all_data[read_count:read_count+csize, :] = chunk_data[:csize, :].astype(np.float64) * 0.000488
+            read_count += csize
             
             # 8바이트 스킵
             data_stream.read(8)
         
-        return data[:total]
+        # 샘플링: 각 초마다 앞 30개씩 추출 (5초간)
+        sampling_rate = 1666  # ACC 샘플링 레이트
+        samples_per_second = 30
+        sampled_data = []
+        
+        for second in range(5):  # 0~4초 (총 5초)
+            start_idx = second * sampling_rate
+            if start_idx + samples_per_second <= read_count:
+                sampled_data.append(all_data[start_idx:start_idx + samples_per_second])
+            else:
+                break
+        
+        if sampled_data:
+            return np.vstack(sampled_data)
+        else:
+            return np.empty((0, 3), dtype=np.float64)
     
     def load_mic_dat_from_s3(self, bucket, key):
         """S3에서 MIC DAT 파일 읽기"""
@@ -561,9 +590,10 @@ class S3ToTimescaleDBApp:
         
         # 각 세트는 1000개 int16 (2000바이트) + 8바이트 스킵 = 2008바이트
         sets = file_size // 2008
-        samples = sets * 1000
+        total_samples = sets * 1000
         
-        data = np.empty(samples, dtype=np.int16)
+        # 전체 데이터를 먼저 읽기
+        all_data = np.empty(total_samples, dtype=np.int16)
         
         for i in range(sets):
             # 1000개 int16 읽기
@@ -572,12 +602,27 @@ class S3ToTimescaleDBApp:
                 break
                 
             chunk = np.frombuffer(chunk_bytes, dtype=np.int16)
-            data[i*1000:(i+1)*1000] = chunk
+            all_data[i*1000:(i+1)*1000] = chunk
             
             # 8바이트 스킵
             data_stream.read(8)
         
-        return data[:i*1000+len(chunk)]
+        # 샘플링: 각 초마다 앞 30개씩 추출 (5초간)
+        sampling_rate = 8000  # MIC 샘플링 레이트
+        samples_per_second = 30
+        sampled_data = []
+        
+        for second in range(5):  # 0~4초 (총 5초)
+            start_idx = second * sampling_rate
+            if start_idx + samples_per_second <= i*1000+len(chunk):
+                sampled_data.append(all_data[start_idx:start_idx + samples_per_second])
+            else:
+                break
+        
+        if sampled_data:
+            return np.hstack(sampled_data)
+        else:
+            return np.empty(0, dtype=np.int16)
     
     def insert_buffer_data(self, table_name, buffer, conn):
         """버퍼 데이터를 COPY로 삽입"""
@@ -604,22 +649,15 @@ class S3ToTimescaleDBApp:
             
             conn.commit()
             
-            # 통계 업데이트
-            if 'normal' in table_name:
-                if 'acc' in table_name:
-                    self.stats['acc_normal'] += inserted
-                else:
-                    self.stats['mic_normal'] += inserted
-            else:
-                if 'acc' in table_name:
-                    self.stats['acc_anomaly'] += inserted
-                else:
-                    self.stats['mic_anomaly'] += inserted
+            self.log(f"  ✅ {table_name}에 {inserted:,}개 레코드 삽입 완료", "SUCCESS")
+            self.stats['total_records'] += inserted
                 
             return inserted
             
         except Exception as e:
-            self.log(f"삽입 오류: {str(e)}")
+            self.log(f"  ❌ {table_name} 삽입 오류: {str(e)}", "ERROR")
+            import traceback
+            self.log(f"  상세: {traceback.format_exc()}")
             conn.rollback()
             raise
         finally:
@@ -630,13 +668,12 @@ class S3ToTimescaleDBApp:
         from io import StringIO
         
         # StringIO 버퍼 사용
-        acc_normal_buffer = StringIO()
-        acc_anomaly_buffer = StringIO()
-        mic_normal_buffer = StringIO()
-        mic_anomaly_buffer = StringIO()
+        acc_buffer = StringIO()
+        mic_buffer = StringIO()
         
         bucket = self.bucket_var.get()
         processed_files = 0
+        skipped_files = 0
         
         for sensor, key in file_batch:
             if not self.is_processing:
@@ -644,78 +681,102 @@ class S3ToTimescaleDBApp:
                 
             filename = os.path.basename(key)
             file_date = self.parse_filename_date(filename)
-            self.log(f"처리 중: {filename}, 날짜: {file_date}")
             
             if not file_date:
-                continue
-            
-            # 정상/비정상 판단
-            is_normal = self.is_in_period(file_date.date(), self.normal_periods)
-            is_anomaly = self.is_in_period(file_date.date(), self.anomaly_periods)
-            self.log(f"  - 정상: {is_normal}, 비정상: {is_anomaly}")
-            self.log(f"[디버그] {filename}: 정상={is_normal}, 비정상={is_anomaly}")
-            
-            if not is_normal and not is_anomaly:
+                self.log(f"  ⚠️ 날짜 파싱 실패: {filename}", "WARNING")
+                skipped_files += 1
                 continue
             
             try:
+                if self.verbose_logging:
+                    self.log(f"  처리 중: {filename} (날짜: {file_date})")
+                
                 if sensor == 'acc':
                     data = self.load_acc_dat_from_s3(bucket, key)
                     n_samples = len(data)
-                    self.log(f"[디버그] ACC 데이터 로드: {n_samples} 샘플")
+                    if self.verbose_logging:
+                        self.log(f"    - ACC 데이터 로드: {n_samples} 샘플")
                     
-                    # 벡터화된 timestamp 생성 (매우 빠름!)
-                    timestamps = pd.date_range(
-                        start=file_date,
-                        periods=n_samples,
-                        freq='600601N'  # 나노초 단위로 정확한 주파수 (1/1666 초)
-                    )
+                    # 샘플링된 데이터의 타임스탬프 계산
+                    # 각 초마다 30개씩, 총 5초
+                    timestamps = []
+                    for second in range(5):
+                        base_time = file_date + pd.Timedelta(seconds=second)
+                        # 각 초의 처음 30개 샘플에 대한 타임스탬프
+                        for sample_idx in range(30):
+                            # ACC는 1666Hz이므로 샘플 간격은 약 600.6μs
+                            sample_time = base_time + pd.Timedelta(microseconds=int(sample_idx * 600.6))
+                            timestamps.append(sample_time)
                     
-                    # 선택할 버퍼
-                    buffer = acc_normal_buffer if is_normal else acc_anomaly_buffer
+                    timestamps = timestamps[:n_samples]  # 실제 샘플 수에 맞춤
                     
                     # 벡터화된 쓰기
                     for i in range(0, n_samples, 10000):  # 10000개씩 처리
                         end_idx = min(i + 10000, n_samples)
                         for j in range(i, end_idx):
-                            buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t"
+                            acc_buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t"
                                        f"{data[j,0]:.6f}\t{data[j,1]:.6f}\t{data[j,2]:.6f}\t{filename}\n")
+                    
+                    if self.verbose_logging:
+                        self.log(f"    - ACC 버퍼에 {n_samples} 레코드 추가")
                     processed_files += 1
                         
-                            
                 else:  # mic
                     data = self.load_mic_dat_from_s3(bucket, key)
                     n_samples = len(data)
+                    if self.verbose_logging:
+                        self.log(f"    - MIC 데이터 로드: {n_samples} 샘플")
                     
-                    # 벡터화된 timestamp 생성
-                    timestamps = pd.date_range(
-                        start=file_date,
-                        periods=n_samples,
-                        freq='125000N'  # 나노초 단위 (1/8000 초)
-                    )
+                    # 샘플링된 데이터의 타임스탬프 계산
+                    timestamps = []
+                    for second in range(5):
+                        base_time = file_date + pd.Timedelta(seconds=second)
+                        # 각 초의 처음 30개 샘플에 대한 타임스탬프
+                        for sample_idx in range(30):
+                            # MIC는 8000Hz이므로 샘플 간격은 125μs
+                            sample_time = base_time + pd.Timedelta(microseconds=int(sample_idx * 125))
+                            timestamps.append(sample_time)
                     
-                    # 선택할 버퍼
-                    buffer = mic_normal_buffer if is_normal else mic_anomaly_buffer
+                    timestamps = timestamps[:n_samples]  # 실제 샘플 수에 맞춤
                     
                     # 벡터화된 쓰기
                     for i in range(0, n_samples, 10000):  # 10000개씩 처리
                         end_idx = min(i + 10000, n_samples)
                         for j in range(i, end_idx):
-                            buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t{data[j]}\t{filename}\n")
+                            mic_buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t{data[j]}\t{filename}\n")
+                    
+                    if self.verbose_logging:
+                        self.log(f"    - MIC 버퍼에 {n_samples} 레코드 추가")
+                    processed_files += 1
                         
-                            
             except Exception as e:
-                self.log(f"파일 처리 오류 ({filename}): {str(e)}")
+                self.log(f"  ❌ 파일 처리 오류 ({filename}): {str(e)}", "ERROR")
                 import traceback
                 self.log(f"상세 오류: {traceback.format_exc()}")
+                skipped_files += 1
                 continue
         
-        self.log(f"[디버그] 배치 완료: {processed_files}개 파일 처리, 버퍼 크기: ACC_N={acc_normal_buffer.tell()}, ACC_A={acc_anomaly_buffer.tell()}, MIC_N={mic_normal_buffer.tell()}, MIC_A={mic_anomaly_buffer.tell()}")
+        self.log(f"\n배치 처리 결과:")
+        self.log(f"  - 처리 완료: {processed_files}개")
+        self.log(f"  - 건너뛴 파일: {skipped_files}개")
+        self.log(f"  - ACC 버퍼 크기: {acc_buffer.tell()} bytes")
+        self.log(f"  - MIC 버퍼 크기: {mic_buffer.tell()} bytes")
+        
+        # 버퍼 크기를 저장 (seek 전에)
+        acc_buffer_size = acc_buffer.tell()
+        mic_buffer_size = mic_buffer.tell()
+        
+        # 버퍼 위치를 처음으로 리셋 (중요!)
+        acc_buffer.seek(0)
+        mic_buffer.seek(0)
+        
+        self.log(f"버퍼 위치 리셋 완료")
+        
         return {
-            'acc_normal': acc_normal_buffer,
-            'acc_anomaly': acc_anomaly_buffer,
-            'mic_normal': mic_normal_buffer,
-            'mic_anomaly': mic_anomaly_buffer
+            'acc': acc_buffer,
+            'mic': mic_buffer,
+            'acc_size': acc_buffer_size,
+            'mic_size': mic_buffer_size
         }
     
     def compress_table_chunks(self, table_name):
@@ -736,7 +797,7 @@ class S3ToTimescaleDBApp:
                     self.log(f"{table_name}: {len(compressed)}개 청크 압축 완료")
                 
             except Exception as e:
-                self.log(f"{table_name} 압축 중 오류: {str(e)}")
+                self.log(f"{table_name} 압축 중 오류: {str(e)}", "WARNING")
         
             conn.commit()
             cur.close()
@@ -746,30 +807,37 @@ class S3ToTimescaleDBApp:
     def process_s3_files(self):
         """S3 파일 처리 메인 로직"""
         try:
-            # PostgreSQL 세션 레벨 성능 설정
-            conn = self.db_pool.getconn()
-            cur = conn.cursor()
+            # 시스템 메모리 확인
+            import psutil
+            total_memory = psutil.virtual_memory().total / (1024**3)  # GB
+            available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+            self.log(f"시스템 메모리: 총 {total_memory:.1f}GB, 사용 가능 {available_memory:.1f}GB")
             
-            # 세션 레벨에서 변경 가능한 설정만 적용
-            session_settings = [
-                "SET synchronous_commit = OFF;",
-                "SET work_mem = '2GB';",
-                "SET maintenance_work_mem = '4GB';",
-                "SET temp_buffers = '1GB';",
-                "SET enable_hashjoin = OFF;",  # 대량 삽입시 메모리 절약
-                "SET enable_mergejoin = OFF;",  # 대량 삽입시 메모리 절약
-            ]
-            
-            for setting in session_settings:
-                try:
-                    cur.execute(setting)
-                except Exception as e:
-                    self.log(f"설정 적용 건너뜀: {setting} - {str(e)}")
-            
-            conn.commit()
-            cur.close()
-            self.db_pool.putconn(conn)
-            self.log("PostgreSQL 세션 성능 설정 완료")
+            # PostgreSQL 세션 레벨 성능 설정 - 메모리의 80% 활용
+            def apply_session_settings(conn):
+                cur = conn.cursor()
+                work_mem = int(available_memory * 0.2 * 1024)  # 20% of available memory in MB
+                maintenance_mem = int(available_memory * 0.3 * 1024)  # 30% of available memory in MB
+                
+                session_settings = [
+                    "SET synchronous_commit = OFF;",
+                    f"SET work_mem = '{work_mem}MB';",
+                    f"SET maintenance_work_mem = '{maintenance_mem}MB';",
+                    f"SET temp_buffers = '{int(available_memory * 0.1 * 1024)}MB';",
+                    "SET effective_io_concurrency = 200;",
+                    "SET max_parallel_workers_per_gather = 8;",
+                ]
+                
+                self.log(f"PostgreSQL 설정: work_mem={work_mem}MB, maintenance_work_mem={maintenance_mem}MB")
+                
+                for setting in session_settings:
+                    try:
+                        cur.execute(setting)
+                    except Exception as e:
+                        self.log(f"설정 적용 건너뜀: {setting} - {str(e)}", "WARNING")
+                
+                conn.commit()
+                cur.close()
             
             # 성능 설정 업데이트
             self.batch_size = self.batch_size_var.get()
@@ -796,39 +864,41 @@ class S3ToTimescaleDBApp:
             # 전체 파일 목록 수집
             all_files = []
             
-            # 날짜 범위에서 실제 필요한 날짜들만 추출
-            date_prefixes = set()
-            for period in self.normal_periods + self.anomaly_periods:
-                current_date = period['start']
-                while current_date <= period['end']:
-                    date_prefixes.add(current_date.strftime("%Y%m%d"))
-                    current_date += timedelta(days=1)
+            # 날짜 범위 가져오기
+            start_date = datetime.strptime(self.start_date.get(), "%Y-%m-%d")
+            end_date = datetime.strptime(self.end_date.get(), "%Y-%m-%d")
+            # 시간 포함한 비교를 위해 end_date는 23:59:59로 설정
+            end_date = end_date.replace(hour=23, minute=59, second=59)
             
-            self.log(f"처리할 날짜: {sorted(date_prefixes)}")
+            self.log(f"날짜 범위: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
             
-            # 센서별, 날짜별로 파일 목록 가져오기
+            # 센서별로 전체 파일 목록 가져오기 (한 번의 API 호출)
             total_files = 0
             for sensor in sensors:
                 sensor_files = 0
                 prefix = f"{machine_id}/raw_dat/{sensor}/"
-                self.log(f"{sensor.upper()} 파일 목록 가져오는 중...")
+                self.log(f"{sensor.upper()} 파일 목록 가져오는 중 (전체 스캔)...")
                 
-                # 날짜별로 나누어 가져오기 (더 빠름)
-                for date_prefix in sorted(date_prefixes):
-                    date_specific_prefix = f"{prefix}{date_prefix}"
-                    
-                    paginator = self.s3_client.get_paginator('list_objects_v2')
-                    pages = paginator.paginate(Bucket=bucket, Prefix=date_specific_prefix)
-                    
-                    for page in pages:
-                        if 'Contents' in page:
-                            for obj in page['Contents']:
-                                if obj['Key'].endswith('.dat'):
+                paginator = self.s3_client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+                
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.dat'):
+                                # 파일명에서 날짜 추출하여 범위 확인
+                                filename = os.path.basename(obj['Key'])
+                                file_date = self.parse_filename_date(filename)
+                                
+                                if file_date and start_date <= file_date <= end_date:
                                     all_files.append((sensor, obj['Key']))
                                     sensor_files += 1
                 
                 self.log(f"{sensor.upper()}: {sensor_files}개 파일")
                 total_files += sensor_files
+            
+            # 파일 이름으로 정렬 (센서별, 날짜순)
+            all_files.sort(key=lambda x: (x[0], x[1]))
             
             self.log(f"총 {len(all_files)}개 파일 발견")
             
@@ -845,42 +915,62 @@ class S3ToTimescaleDBApp:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = []
                 
+                self.log(f"\n파일 배치 처리 시작: 총 {len(file_batches)}개 배치")
+                
                 for batch_idx, file_batch in enumerate(file_batches):
                     if not self.is_processing:
                         break
                     
+                    self.log(f"\n배치 {batch_idx+1}/{len(file_batches)} 제출 ({len(file_batch)}개 파일)")
                     future = executor.submit(self.process_file_batch, file_batch, machine_id)
                     futures.append((batch_idx, future))
                     
+                    # 디버깅: 제출된 future 확인
+                    self.log(f"Future 제출됨: batch_idx={batch_idx}, future={future}")
+                    
                 # 결과 수집 및 DB 삽입
+                self.log(f"\n배치 결과 수집 및 DB 삽입 시작")
                 for batch_idx, future in futures:
                     if not self.is_processing:
                         break
                         
                     try:
+                        self.log(f"배치 {batch_idx+1} 결과 대기 중...")
                         result = future.result(timeout=300)  # 5분 타임아웃
+                        self.log(f"\n배치 {batch_idx+1} 결과 수신")
+                        
+                        # 디버깅: 결과 확인
+                        self.log(f"ACC 버퍼 크기: {result.get('acc_size', 0)} bytes")
+                        self.log(f"MIC 버퍼 크기: {result.get('mic_size', 0)} bytes")
                         
                         # 각 워커에 대해 별도의 DB 연결 사용
                         conn = self.db_pool.getconn()
                         try:
+                            # 각 연결에 세션 설정 적용
+                            apply_session_settings(conn)
+                            
                             # 배치 데이터 삽입
-                            if result['acc_normal'].tell() > 0:
-                                inserted = self.insert_buffer_data('normal_acc_data', result['acc_normal'], conn)
-                                self.stats['total_records'] += inserted
+                            if result.get('acc_size', 0) > 0:
+                                self.log(f"  ACC 데이터 삽입 중... (버퍼 크기: {result['acc_size']} bytes)")
+                                inserted = self.insert_buffer_data('normal_acc_data', result['acc'], conn)
+                                self.log(f"  ACC 삽입 완료: {inserted}개 레코드")
+                            else:
+                                self.log(f"  ACC 버퍼가 비어있음")
                             
-                            if result['acc_anomaly'].tell() > 0:
-                                inserted = self.insert_buffer_data('anomaly_acc_data', result['acc_anomaly'], conn)
-                                self.stats['total_records'] += inserted
-                            
-                            if result['mic_normal'].tell() > 0:
-                                inserted = self.insert_buffer_data('normal_mic_data', result['mic_normal'], conn)
-                                self.stats['total_records'] += inserted
-                            
-                            if result['mic_anomaly'].tell() > 0:
-                                inserted = self.insert_buffer_data('anomaly_mic_data', result['mic_anomaly'], conn)
-                                self.stats['total_records'] += inserted
+                            if result.get('mic_size', 0) > 0:
+                                self.log(f"  MIC 데이터 삽입 중... (버퍼 크기: {result['mic_size']} bytes)")
+                                inserted = self.insert_buffer_data('normal_mic_data', result['mic'], conn)
+                                self.log(f"  MIC 삽입 완료: {inserted}개 레코드")
+                            else:
+                                self.log(f"  MIC 버퍼가 비어있음")
+                                
+                            # 디버깅: 커밋 확인
+                            self.log(f"  DB 커밋 중...")
+                            conn.commit()
+                            self.log(f"  DB 커밋 완료")
                         finally:
                             self.db_pool.putconn(conn)
+                            self.log(f"  DB 연결 반환 완료")
                         
                         # 통계 업데이트
                         self.stats['processed_files'] += self.file_batch_size
@@ -903,51 +993,63 @@ class S3ToTimescaleDBApp:
                             remaining_files = len(all_files) - self.stats['processed_files']
                             eta = remaining_files / files_per_sec if files_per_sec > 0 else 0
                             
-                            self.status_label.config(
-                                text=f"처리 중: 배치 {batch_idx+1}/{len(file_batches)} "
-                                     f"({self.stats['processed_files']}/{len(all_files)} 파일)"
-                            )
-                            
-                            self.stats_label.config(
-                                text=f"속도: {files_per_sec:.1f} 파일/초, "
-                                     f"{records_per_sec:.0f} 레코드/초"
-                            )
-                            
-                            eta_hours = int(eta // 3600)
-                            eta_minutes = int((eta % 3600) // 60)
-                            self.eta_label.config(
-                                text=f"예상 남은 시간: {eta_hours}시간 {eta_minutes}분"
-                            )
+                            # UI 업데이트는 1초에 한 번만
+                            current_time = time.time()
+                            if current_time - self.last_log_update > 1.0:
+                                self.status_label.config(
+                                    text=f"처리 중: 배치 {batch_idx+1}/{len(file_batches)} "
+                                         f"({self.stats['processed_files']}/{len(all_files)} 파일)"
+                                )
+                                
+                                self.stats_label.config(
+                                    text=f"속도: {files_per_sec:.1f} 파일/초, "
+                                         f"{records_per_sec:.0f} 레코드/초"
+                                )
+                                
+                                eta_hours = int(eta // 3600)
+                                eta_minutes = int((eta % 3600) // 60)
+                                self.eta_label.config(
+                                    text=f"예상 남은 시간: {eta_hours}시간 {eta_minutes}분"
+                                )
+                                self.last_log_update = current_time
                         
                         # 주기적 압축 (200개 배치마다)
                         if batch_idx % 200 == 0 and batch_idx > 0:
                             self.log("청크 압축 중...")
-                            for table_name in ['normal_acc_data', 'normal_mic_data', 
-                                             'anomaly_acc_data', 'anomaly_mic_data']:
+                            for table_name in ['normal_acc_data', 'normal_mic_data']:
                                 self.compress_table_chunks(table_name)
                                 
                     except Exception as e:
-                        self.log(f"배치 {batch_idx} 처리 오류: {str(e)}")
+                        self.log(f"배치 {batch_idx+1} 처리 오류: {str(e)}", "ERROR")
+                        import traceback
+                        self.log(f"상세 오류:\n{traceback.format_exc()}", "ERROR")
                         continue
             
             # autovacuum 다시 활성화 및 인덱스 생성
             conn = self.db_pool.getconn()
             try:
+                # VACUUM을 위해 별도의 autocommit 연결 사용
+                conn.autocommit = True
                 cur = conn.cursor()
-                for table in ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']:
-                    cur.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = true);")
-                    # 인덱스 생성
-                    cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_machine_time ON {table} (machine_id, time DESC);")
-                    # VACUUM ANALYZE 실행
-                    cur.execute(f"VACUUM ANALYZE {table};")
-                conn.commit()
+                
+                for table in ['normal_acc_data', 'normal_mic_data']:
+                    try:
+                        cur.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = true);")
+                        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_machine_time ON {table} (machine_id, time DESC);")
+                        self.log(f"{table} 인덱스 생성 완료")
+                        
+                        cur.execute(f"VACUUM ANALYZE {table};")
+                        self.log(f"{table} VACUUM ANALYZE 완료")
+                    except Exception as e:
+                        self.log(f"{table} 후처리 중 오류: {str(e)}", "WARNING")
+                
                 cur.close()
             finally:
                 self.db_pool.putconn(conn)
             
             # 최종 압축
             self.log("\n최종 압축 중...")
-            for table_name in ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']:
+            for table_name in ['normal_acc_data', 'normal_mic_data']:
                 self.compress_table_chunks(table_name)
             
             # 처리 시간 계산
@@ -955,13 +1057,11 @@ class S3ToTimescaleDBApp:
             hours = int(total_time // 3600)
             minutes = int((total_time % 3600) // 60)
             
-            self.log(f"\n처리 완료!")
+            self.log(f"\n처리 완료!", "SUCCESS")
             self.log(f"총 처리 시간: {hours}시간 {minutes}분")
             self.log(f"총 파일: {self.stats['processed_files']:,}")
             self.log(f"총 레코드: {self.stats['total_records']:,}")
-            self.log(f"센서별 통계:")
-            self.log(f"  - ACC 정상: {self.stats['acc_normal']:,}, 비정상: {self.stats['acc_anomaly']:,}")
-            self.log(f"  - MIC 정상: {self.stats['mic_normal']:,}, 비정상: {self.stats['mic_anomaly']:,}")
+            self.log(f"로그 파일: {self.log_filename}")
             
             messagebox.showinfo("완료", 
                 f"처리 완료!\n\n"
@@ -970,7 +1070,7 @@ class S3ToTimescaleDBApp:
                 f"총 레코드: {self.stats['total_records']:,}")
             
         except Exception as e:
-            self.log(f"처리 중 오류 발생: {str(e)}")
+            self.log(f"처리 중 오류 발생: {str(e)}", "ERROR")
             messagebox.showerror("오류", f"처리 중 오류 발생: {str(e)}")
         
         finally:
@@ -986,8 +1086,14 @@ class S3ToTimescaleDBApp:
             messagebox.showerror("오류", "먼저 연결 테스트를 수행해주세요.")
             return
         
-        if not self.normal_periods and not self.anomaly_periods:
-            messagebox.showerror("오류", "최소 하나의 기간을 설정해주세요.")
+        try:
+            start_date = datetime.strptime(self.start_date.get(), "%Y-%m-%d")
+            end_date = datetime.strptime(self.end_date.get(), "%Y-%m-%d")
+            if start_date > end_date:
+                messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
+                return
+        except ValueError:
+            messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
             return
         
         self.is_processing = True
@@ -1003,6 +1109,8 @@ class S3ToTimescaleDBApp:
         """처리 중지"""
         self.is_processing = False
         self.log("처리 중지 요청...")
+        self.stop_btn.config(state='disabled')
+        self.process_btn.config(state='normal')
 
 
 def main():

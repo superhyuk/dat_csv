@@ -1,3 +1,4 @@
 .env
 /dat/*
 /S3_Downloads/*
+/logs/*
