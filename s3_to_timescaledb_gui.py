@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import threading
 import boto3
 import psycopg2
+from psycopg2 import pool
 import numpy as np
 from io import BytesIO
 import os
@@ -29,19 +30,23 @@ class S3ToTimescaleDBApp:
         
         # 변수 초기화
         self.s3_client = None
-        self.db_conn = None
+        self.db_pool = None
         self.normal_periods = []
         self.anomaly_periods = []
         self.is_processing = False
         
         # 배치 처리 설정
-        self.batch_size = 10000  # 한 번에 삽입할 레코드 수
+        self.batch_size = 100000  # 한 번에 삽입할 레코드 수
         self.file_batch_size = 50  # 한 번에 처리할 파일 수
         self.commit_interval = 100  # 커밋 간격 (파일 수)
         self.max_workers = 5  # 동시 처리 워커 수
         
         # 통계 정보
         self.stats = {'processed_files': 0, 'total_records': 0, 'start_time': None}
+        self.stats['acc_normal'] = 0
+        self.stats['acc_anomaly'] = 0
+        self.stats['mic_normal'] = 0
+        self.stats['mic_anomaly'] = 0
         
         # UI 생성
         self.create_widgets()
@@ -138,9 +143,9 @@ class S3ToTimescaleDBApp:
         
         # 성능 설정 추가
         ttk.Label(machine_frame, text="배치 크기:").grid(row=1, column=0, sticky=tk.W, padx=5)
-        self.batch_size_var = tk.IntVar(value=10000)
-        batch_spinbox = ttk.Spinbox(machine_frame, from_=1000, to=50000, increment=1000, 
-                                   textvariable=self.batch_size_var, width=10)
+        self.batch_size_var = tk.IntVar(value=100000)
+        batch_spinbox = ttk.Spinbox(machine_frame, from_=10000, to=1000000, increment=10000, 
+                                   textvariable=self.batch_size_var, width=12)
         batch_spinbox.grid(row=1, column=1, padx=5)
         
         ttk.Label(machine_frame, text="동시 처리:").grid(row=1, column=2, sticky=tk.W, padx=20)
@@ -150,8 +155,8 @@ class S3ToTimescaleDBApp:
         workers_spinbox.grid(row=1, column=3, padx=5)
         
         ttk.Label(machine_frame, text="파일 배치:").grid(row=1, column=4, sticky=tk.W, padx=5)
-        self.file_batch_var = tk.IntVar(value=50)
-        file_batch_spinbox = ttk.Spinbox(machine_frame, from_=10, to=200, increment=10,
+        self.file_batch_var = tk.IntVar(value=100)
+        file_batch_spinbox = ttk.Spinbox(machine_frame, from_=10, to=500, increment=10,
                                         textvariable=self.file_batch_var, width=10)
         file_batch_spinbox.grid(row=1, column=5, padx=5)
         
@@ -264,7 +269,9 @@ class S3ToTimescaleDBApp:
             self.log(f"S3 연결 성공! {len(buckets['Buckets'])}개 버킷 발견")
             
             # TimescaleDB 연결 테스트
-            self.db_conn = psycopg2.connect(
+            # 연결 풀 생성
+            self.db_pool = psycopg2.pool.ThreadedConnectionPool(
+                1, self.max_workers + 1,  # min, max connections
                 host="localhost",
                 port="5432",
                 database="pdm_db",
@@ -273,13 +280,17 @@ class S3ToTimescaleDBApp:
             )
             self.log("TimescaleDB 연결 성공!")
             
+            # 테스트 연결
+            test_conn = self.db_pool.getconn()
+            
             # TimescaleDB extension 확인
-            cur = self.db_conn.cursor()
+            cur = test_conn.cursor()
             cur.execute("SELECT default_version FROM pg_available_extensions WHERE name = 'timescaledb';")
             result = cur.fetchone()
             if result:
                 self.log(f"TimescaleDB 버전: {result[0]}")
             cur.close()
+            self.db_pool.putconn(test_conn)
             
             messagebox.showinfo("성공", "S3 및 TimescaleDB 연결 성공!")
             
@@ -424,76 +435,80 @@ class S3ToTimescaleDBApp:
     
     def create_tables(self):
         """TimescaleDB 테이블 생성"""
-        cur = self.db_conn.cursor()
+        conn = self.db_pool.getconn()
+        try:
+            cur = conn.cursor()
         
-        # TimescaleDB extension 활성화
-        cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+            # TimescaleDB extension 활성화
+            cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
         
-        # 정상 ACC 테이블
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS normal_acc_data (
-                time TIMESTAMPTZ NOT NULL,
-                machine_id TEXT NOT NULL,
-                x DOUBLE PRECISION,
-                y DOUBLE PRECISION,
-                z DOUBLE PRECISION,
-                filename TEXT
-            );
-        """)
+            # 정상 ACC 테이블
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS normal_acc_data (
+                    time TIMESTAMPTZ NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    x DOUBLE PRECISION,
+                    y DOUBLE PRECISION,
+                    z DOUBLE PRECISION,
+                    filename TEXT
+                );
+            """)
         
-        # 정상 MIC 테이블
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS normal_mic_data (
-                time TIMESTAMPTZ NOT NULL,
-                machine_id TEXT NOT NULL,
-                mic_value INTEGER,
-                filename TEXT
-            );
-        """)
+            # 정상 MIC 테이블
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS normal_mic_data (
+                    time TIMESTAMPTZ NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    mic_value INTEGER,
+                    filename TEXT
+                );
+            """)
         
-        # 비정상 ACC 테이블
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS anomaly_acc_data (
-                time TIMESTAMPTZ NOT NULL,
-                machine_id TEXT NOT NULL,
-                x DOUBLE PRECISION,
-                y DOUBLE PRECISION,
-                z DOUBLE PRECISION,
-                filename TEXT
-            );
-        """)
+            # 비정상 ACC 테이블
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS anomaly_acc_data (
+                    time TIMESTAMPTZ NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    x DOUBLE PRECISION,
+                    y DOUBLE PRECISION,
+                    z DOUBLE PRECISION,
+                    filename TEXT
+                );
+            """)
         
-        # 비정상 MIC 테이블
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS anomaly_mic_data (
-                time TIMESTAMPTZ NOT NULL,
-                machine_id TEXT NOT NULL,
-                mic_value INTEGER,
-                filename TEXT
-            );
-        """)
+            # 비정상 MIC 테이블
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS anomaly_mic_data (
+                    time TIMESTAMPTZ NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    mic_value INTEGER,
+                    filename TEXT
+                );
+            """)
         
-        # 하이퍼테이블로 변환
-        tables = ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']
-        for table in tables:
-            try:
-                cur.execute(f"SELECT create_hypertable('{table}', 'time', if_not_exists => TRUE);")
-                self.log(f"{table} 하이퍼테이블 생성/확인 완료")
+            # 하이퍼테이블로 변환
+            tables = ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']
+            for table in tables:
+                try:
+                    cur.execute(f"SELECT create_hypertable('{table}', 'time', if_not_exists => TRUE);")
+                    self.log(f"{table} 하이퍼테이블 생성/확인 완료")
                 
-                # 압축 설정
-                cur.execute(f"""
-                    ALTER TABLE {table} SET (
-                        timescaledb.compress,
-                        timescaledb.compress_segmentby = 'machine_id',
-                        timescaledb.compress_orderby = 'time DESC'
-                    );
-                """)
+                    # 압축 설정
+                    cur.execute(f"""
+                        ALTER TABLE {table} SET (
+                            timescaledb.compress,
+                            timescaledb.compress_segmentby = 'machine_id',
+                            timescaledb.compress_orderby = 'time DESC'
+                        );
+                    """)
                 
-            except Exception as e:
-                self.log(f"{table} 하이퍼테이블 설정 중 오류 (이미 존재할 수 있음): {str(e)}")
+                except Exception as e:
+                    self.log(f"{table} 하이퍼테이블 설정 중 오류 (이미 존재할 수 있음): {str(e)}")
         
-        self.db_conn.commit()
-        cur.close()
+            conn.commit()
+            cur.close()
+        finally:
+            self.db_pool.putconn(conn)
     
     def load_acc_dat_from_s3(self, bucket, key):
         """S3에서 ACC DAT 파일 읽기"""
@@ -558,9 +573,9 @@ class S3ToTimescaleDBApp:
         
         return data[:i*1000+len(chunk)]
     
-    def insert_acc_data_batch(self, table_name, batch_data):
+    def insert_acc_data_batch(self, table_name, batch_data, conn):
         """ACC 데이터를 배치로 DB에 삽입"""
-        cur = self.db_conn.cursor()
+        cur = conn.cursor()
         
         try:
             # COPY를 사용한 대량 삽입을 위해 데이터 준비
@@ -573,18 +588,26 @@ class S3ToTimescaleDBApp:
             )
             
             inserted = len(batch_data)
+            conn.commit()  # 각 배치마다 커밋
+            
+            # 통계 업데이트
+            if 'normal' in table_name:
+                self.stats['acc_normal'] += inserted
+            else:
+                self.stats['acc_anomaly'] += inserted
+                
         except Exception as e:
             self.log(f"배치 삽입 오류: {str(e)}")
-            self.db_conn.rollback()
+            conn.rollback()
             raise
         finally:
             cur.close()
         
         return inserted
     
-    def insert_mic_data_batch(self, table_name, batch_data):
+    def insert_mic_data_batch(self, table_name, batch_data, conn):
         """MIC 데이터를 배치로 DB에 삽입"""
-        cur = self.db_conn.cursor()
+        cur = conn.cursor()
         
         try:
             execute_values(
@@ -596,9 +619,17 @@ class S3ToTimescaleDBApp:
             )
             
             inserted = len(batch_data)
+            conn.commit()  # 각 배치마다 커밋
+            
+            # 통계 업데이트
+            if 'normal' in table_name:
+                self.stats['mic_normal'] += inserted
+            else:
+                self.stats['mic_anomaly'] += inserted
+                
         except Exception as e:
             self.log(f"배치 삽입 오류: {str(e)}")
-            self.db_conn.rollback()
+            conn.rollback()
             raise
         finally:
             cur.close()
@@ -629,6 +660,7 @@ class S3ToTimescaleDBApp:
             is_anomaly = self.is_in_period(file_date.date(), self.anomaly_periods)
             
             if not is_normal and not is_anomaly:
+                self.log(f"파일 건너뜀 (기간 밖): {filename} - {file_date.date()}")
                 continue
             
             try:
@@ -636,31 +668,47 @@ class S3ToTimescaleDBApp:
                     data = self.load_acc_dat_from_s3(bucket, key)
                     sampling_rate = 1666.0
                     
-                    # 데이터를 배치에 추가
-                    for i in range(len(data)):
-                        time_offset = i / sampling_rate
-                        timestamp = file_date + timedelta(seconds=time_offset)
-                        row = (timestamp, machine_id, float(data[i, 0]), float(data[i, 1]), float(data[i, 2]), filename)
+                    # 데이터를 청크로 나누어 처리 (메모리 최적화)
+                    chunk_size = 10000
+                    for chunk_start in range(0, len(data), chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, len(data))
                         
-                        if is_normal:
-                            acc_normal_batch.append(row)
-                        else:
-                            acc_anomaly_batch.append(row)
+                        for i in range(chunk_start, chunk_end):
+                            time_offset = i / sampling_rate
+                            timestamp = file_date + timedelta(seconds=time_offset)
+                            row = (timestamp, machine_id, float(data[i, 0]), float(data[i, 1]), float(data[i, 2]), filename)
+                        
+                            if is_normal:
+                                acc_normal_batch.append(row)
+                            else:
+                                acc_anomaly_batch.append(row)
+                        
+                        # 배치가 너무 커지면 중간에 처리
+                        if len(acc_normal_batch) >= self.batch_size or len(acc_anomaly_batch) >= self.batch_size:
+                            break
                             
                 else:  # mic
                     data = self.load_mic_dat_from_s3(bucket, key)
                     sampling_rate = 8000.0
                     
-                    # 데이터를 배치에 추가
-                    for i in range(len(data)):
-                        time_offset = i / sampling_rate
-                        timestamp = file_date + timedelta(seconds=time_offset)
-                        row = (timestamp, machine_id, int(data[i]), filename)
+                    # 데이터를 청크로 나누어 처리 (메모리 최적화)
+                    chunk_size = 10000
+                    for chunk_start in range(0, len(data), chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, len(data))
                         
-                        if is_normal:
-                            mic_normal_batch.append(row)
-                        else:
-                            mic_anomaly_batch.append(row)
+                        for i in range(chunk_start, chunk_end):
+                            time_offset = i / sampling_rate
+                            timestamp = file_date + timedelta(seconds=time_offset)
+                            row = (timestamp, machine_id, int(data[i]), filename)
+                        
+                            if is_normal:
+                                mic_normal_batch.append(row)
+                            else:
+                                mic_anomaly_batch.append(row)
+                        
+                        # 배치가 너무 커지면 중간에 처리
+                        if len(mic_normal_batch) >= self.batch_size or len(mic_anomaly_batch) >= self.batch_size:
+                            break
                             
             except Exception as e:
                 self.log(f"파일 처리 오류 ({filename}): {str(e)}")
@@ -675,24 +723,28 @@ class S3ToTimescaleDBApp:
     
     def compress_table_chunks(self, table_name):
         """테이블의 압축되지 않은 청크 압축"""
-        cur = self.db_conn.cursor()
-        
+        conn = self.db_pool.getconn()
         try:
-            # 압축되지 않은 청크 찾기
-            cur.execute(f"""
-                SELECT compress_chunk(i, if_not_compressed=>true)
-                FROM show_chunks('{table_name}') i;
-            """)
-            
-            compressed = cur.fetchall()
-            if compressed:
-                self.log(f"{table_name}: {len(compressed)}개 청크 압축 완료")
-                
-        except Exception as e:
-            self.log(f"{table_name} 압축 중 오류: {str(e)}")
+            cur = conn.cursor()
         
-        self.db_conn.commit()
-        cur.close()
+            try:
+                # 압축되지 않은 청크 찾기
+                cur.execute(f"""
+                    SELECT compress_chunk(i, if_not_compressed=>true)
+                    FROM show_chunks('{table_name}') i;
+                """)
+            
+                compressed = cur.fetchall()
+                if compressed:
+                    self.log(f"{table_name}: {len(compressed)}개 청크 압축 완료")
+                
+            except Exception as e:
+                self.log(f"{table_name} 압축 중 오류: {str(e)}")
+        
+            conn.commit()
+            cur.close()
+        finally:
+            self.db_pool.putconn(conn)
     
     def process_s3_files(self):
         """S3 파일 처리 메인 로직"""
@@ -764,29 +816,40 @@ class S3ToTimescaleDBApp:
                     try:
                         result = future.result(timeout=300)  # 5분 타임아웃
                         
-                        # 배치 데이터 삽입
-                        if result['acc_normal']:
-                            self.insert_acc_data_batch('normal_acc_data', result['acc_normal'])
-                            self.stats['total_records'] += len(result['acc_normal'])
+                        # 각 워커에 대해 별도의 DB 연결 사용
+                        conn = self.db_pool.getconn()
+                        try:
+                            # 배치 데이터 삽입
+                            if result['acc_normal']:
+                                inserted = self.insert_acc_data_batch('normal_acc_data', result['acc_normal'], conn)
+                                self.stats['total_records'] += inserted
                             
-                        if result['acc_anomaly']:
-                            self.insert_acc_data_batch('anomaly_acc_data', result['acc_anomaly'])
-                            self.stats['total_records'] += len(result['acc_anomaly'])
+                            if result['acc_anomaly']:
+                                inserted = self.insert_acc_data_batch('anomaly_acc_data', result['acc_anomaly'], conn)
+                                self.stats['total_records'] += inserted
                             
-                        if result['mic_normal']:
-                            self.insert_mic_data_batch('normal_mic_data', result['mic_normal'])
-                            self.stats['total_records'] += len(result['mic_normal'])
+                            if result['mic_normal']:
+                                inserted = self.insert_mic_data_batch('normal_mic_data', result['mic_normal'], conn)
+                                self.stats['total_records'] += inserted
                             
-                        if result['mic_anomaly']:
-                            self.insert_mic_data_batch('anomaly_mic_data', result['mic_anomaly'])
-                            self.stats['total_records'] += len(result['mic_anomaly'])
+                            if result['mic_anomaly']:
+                                inserted = self.insert_mic_data_batch('anomaly_mic_data', result['mic_anomaly'], conn)
+                                self.stats['total_records'] += inserted
+                        finally:
+                            self.db_pool.putconn(conn)
                         
                         # 통계 업데이트
                         self.stats['processed_files'] += len(file_batch)
                         
-                        # 주기적 커밋
-                        if batch_idx % 10 == 0:  # 10개 배치마다 커밋
-                            self.db_conn.commit()
+                        # 상세 통계 로그
+                        if batch_idx % 5 == 0:
+                            self.log(f"배치 {batch_idx+1}/{len(file_batches)} 완료:")
+                            self.log(f"  - ACC 정상: {self.stats['acc_normal']:,} 레코드")
+                            self.log(f"  - ACC 비정상: {self.stats['acc_anomaly']:,} 레코드")
+                            self.log(f"  - MIC 정상: {self.stats['mic_normal']:,} 레코드")
+                            self.log(f"  - MIC 비정상: {self.stats['mic_anomaly']:,} 레코드")
+                            self.log(f"  - 총 파일: {self.stats['processed_files']:,}")
+                            self.log(f"  - 총 레코드: {self.stats['total_records']:,}")
                             
                         # 진행 상황 업데이트
                         progress = (self.stats['processed_files'] / len(all_files)) * 100
@@ -816,12 +879,6 @@ class S3ToTimescaleDBApp:
                                 text=f"예상 남은 시간: {eta_hours}시간 {eta_minutes}분"
                             )
                         
-                        # 로그 (배치마다)
-                        if batch_idx % 5 == 0:
-                            self.log(f"배치 {batch_idx+1}/{len(file_batches)} 완료 - "
-                                   f"총 {self.stats['processed_files']} 파일, "
-                                   f"{self.stats['total_records']:,} 레코드 처리")
-                        
                         # 주기적 압축 (20개 배치마다)
                         if batch_idx % 20 == 0 and batch_idx > 0:
                             self.log("청크 압축 중...")
@@ -833,9 +890,8 @@ class S3ToTimescaleDBApp:
                         self.log(f"배치 {batch_idx} 처리 오류: {str(e)}")
                         continue
             
-            # 최종 커밋 및 압축
-            self.db_conn.commit()
-            self.log("최종 압축 중...")
+            # 최종 압축
+            self.log("\n최종 압축 중...")
             for table_name in ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']:
                 self.compress_table_chunks(table_name)
             
@@ -848,6 +904,9 @@ class S3ToTimescaleDBApp:
             self.log(f"총 처리 시간: {hours}시간 {minutes}분")
             self.log(f"총 파일: {self.stats['processed_files']:,}")
             self.log(f"총 레코드: {self.stats['total_records']:,}")
+            self.log(f"센서별 통계:")
+            self.log(f"  - ACC 정상: {self.stats['acc_normal']:,}, 비정상: {self.stats['acc_anomaly']:,}")
+            self.log(f"  - MIC 정상: {self.stats['mic_normal']:,}, 비정상: {self.stats['mic_anomaly']:,}")
             
             messagebox.showinfo("완료", 
                 f"처리 완료!\n\n"
@@ -868,7 +927,7 @@ class S3ToTimescaleDBApp:
     
     def start_processing(self):
         """처리 시작"""
-        if not self.s3_client or not self.db_conn:
+        if not self.s3_client or not self.db_pool:
             messagebox.showerror("오류", "먼저 연결 테스트를 수행해주세요.")
             return
         
