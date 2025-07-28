@@ -1,0 +1,30 @@
+version: '3'
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb_pdm
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=pdm_db
+      - POSTGRES_USER=pdm_user
+      - POSTGRES_PASSWORD=pdm_password
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_pdm
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - timescaledb
+
+volumes:
+  timescale_data:
+  grafana_data:
