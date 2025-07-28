@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 import time
 import struct
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+from psycopg2.extras import execute_values
+
 class S3ToTimescaleDBApp:
     def __init__(self, root):
         self.root = root
@@ -29,6 +33,15 @@ class S3ToTimescaleDBApp:
         self.normal_periods = []
         self.anomaly_periods = []
         self.is_processing = False
+        
+        # 배치 처리 설정
+        self.batch_size = 10000  # 한 번에 삽입할 레코드 수
+        self.file_batch_size = 50  # 한 번에 처리할 파일 수
+        self.commit_interval = 100  # 커밋 간격 (파일 수)
+        self.max_workers = 5  # 동시 처리 워커 수
+        
+        # 통계 정보
+        self.stats = {'processed_files': 0, 'total_records': 0, 'start_time': None}
         
         # UI 생성
         self.create_widgets()
@@ -123,6 +136,25 @@ class S3ToTimescaleDBApp:
         ttk.Checkbutton(machine_frame, text="ACC", variable=self.sensor_acc).grid(row=0, column=3, padx=5)
         ttk.Checkbutton(machine_frame, text="MIC", variable=self.sensor_mic).grid(row=0, column=4, padx=5)
         
+        # 성능 설정 추가
+        ttk.Label(machine_frame, text="배치 크기:").grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.batch_size_var = tk.IntVar(value=10000)
+        batch_spinbox = ttk.Spinbox(machine_frame, from_=1000, to=50000, increment=1000, 
+                                   textvariable=self.batch_size_var, width=10)
+        batch_spinbox.grid(row=1, column=1, padx=5)
+        
+        ttk.Label(machine_frame, text="동시 처리:").grid(row=1, column=2, sticky=tk.W, padx=20)
+        self.workers_var = tk.IntVar(value=5)
+        workers_spinbox = ttk.Spinbox(machine_frame, from_=1, to=20, increment=1,
+                                     textvariable=self.workers_var, width=10)
+        workers_spinbox.grid(row=1, column=3, padx=5)
+        
+        ttk.Label(machine_frame, text="파일 배치:").grid(row=1, column=4, sticky=tk.W, padx=5)
+        self.file_batch_var = tk.IntVar(value=50)
+        file_batch_spinbox = ttk.Spinbox(machine_frame, from_=10, to=200, increment=10,
+                                        textvariable=self.file_batch_var, width=10)
+        file_batch_spinbox.grid(row=1, column=5, padx=5)
+        
     def create_period_section(self, parent):
         # 기간 설정 프레임
         period_frame = ttk.LabelFrame(parent, text="기간 설정", padding="5")
@@ -203,11 +235,19 @@ class S3ToTimescaleDBApp:
         self.status_label = ttk.Label(progress_frame, text="대기 중...")
         self.status_label.grid(row=1, column=0, sticky=tk.W, padx=5)
         
+        # 통계 정보 레이블 추가
+        self.stats_label = ttk.Label(progress_frame, text="")
+        self.stats_label.grid(row=2, column=0, sticky=tk.W, padx=5)
+        
+        # 예상 시간 레이블
+        self.eta_label = ttk.Label(progress_frame, text="")
+        self.eta_label.grid(row=3, column=0, sticky=tk.W, padx=5)
+        
         # 로그 텍스트
         self.log_text = scrolledtext.ScrolledText(progress_frame, height=10, width=80)
-        self.log_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        self.log_text.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
-        progress_frame.rowconfigure(2, weight=1)
+        progress_frame.rowconfigure(4, weight=1)
         
     def test_connections(self):
         """AWS S3 및 TimescaleDB 연결 테스트"""
@@ -518,61 +558,120 @@ class S3ToTimescaleDBApp:
         
         return data[:i*1000+len(chunk)]
     
-    def insert_acc_data(self, table_name, machine_id, filename, base_time, data):
-        """ACC 데이터를 DB에 삽입"""
+    def insert_acc_data_batch(self, table_name, batch_data):
+        """ACC 데이터를 배치로 DB에 삽입"""
         cur = self.db_conn.cursor()
         
-        # 샘플링 레이트 (1666Hz)
-        sampling_rate = 1666.0
+        try:
+            # COPY를 사용한 대량 삽입을 위해 데이터 준비
+            execute_values(
+                cur,
+                f"INSERT INTO {table_name} (time, machine_id, x, y, z, filename) VALUES %s",
+                batch_data,
+                template="(%s, %s, %s, %s, %s, %s)",
+                page_size=1000
+            )
+            
+            inserted = len(batch_data)
+        except Exception as e:
+            self.log(f"배치 삽입 오류: {str(e)}")
+            self.db_conn.rollback()
+            raise
+        finally:
+            cur.close()
         
-        # 데이터 준비
-        values = []
-        for i in range(len(data)):
-            time_offset = i / sampling_rate
-            timestamp = base_time + timedelta(seconds=time_offset)
-            values.append((timestamp, machine_id, float(data[i, 0]), float(data[i, 1]), float(data[i, 2]), filename))
-        
-        # 배치 삽입
-        from psycopg2.extras import execute_values
-        execute_values(
-            cur,
-            f"INSERT INTO {table_name} (time, machine_id, x, y, z, filename) VALUES %s",
-            values,
-            template="(%s, %s, %s, %s, %s, %s)"
-        )
-        
-        self.db_conn.commit()
-        cur.close()
-        
-        return len(values)
+        return inserted
     
-    def insert_mic_data(self, table_name, machine_id, filename, base_time, data):
-        """MIC 데이터를 DB에 삽입"""
+    def insert_mic_data_batch(self, table_name, batch_data):
+        """MIC 데이터를 배치로 DB에 삽입"""
         cur = self.db_conn.cursor()
         
-        # 샘플링 레이트 (8000Hz)
-        sampling_rate = 8000.0
+        try:
+            execute_values(
+                cur,
+                f"INSERT INTO {table_name} (time, machine_id, mic_value, filename) VALUES %s",
+                batch_data,
+                template="(%s, %s, %s, %s)",
+                page_size=1000
+            )
+            
+            inserted = len(batch_data)
+        except Exception as e:
+            self.log(f"배치 삽입 오류: {str(e)}")
+            self.db_conn.rollback()
+            raise
+        finally:
+            cur.close()
         
-        # 데이터 준비
-        values = []
-        for i in range(len(data)):
-            time_offset = i / sampling_rate
-            timestamp = base_time + timedelta(seconds=time_offset)
-            values.append((timestamp, machine_id, int(data[i]), filename))
+        return inserted
+    
+    def process_file_batch(self, file_batch, machine_id):
+        """파일 배치를 처리하고 데이터를 준비"""
+        acc_normal_batch = []
+        acc_anomaly_batch = []
+        mic_normal_batch = []
+        mic_anomaly_batch = []
         
-        # 배치 삽입
-        from psycopg2.extras import execute_values
-        execute_values(
-            cur,
-            f"INSERT INTO {table_name} (time, machine_id, mic_value, filename) VALUES %s",
-            values,
-            template="(%s, %s, %s, %s)"
-        )
+        bucket = self.bucket_var.get()
         
-        self.db_conn.commit()
-        cur.close()
+        for sensor, key in file_batch:
+            if not self.is_processing:
+                break
+                
+            filename = os.path.basename(key)
+            file_date = self.parse_filename_date(filename)
+            
+            if not file_date:
+                continue
+            
+            # 정상/비정상 판단
+            is_normal = self.is_in_period(file_date.date(), self.normal_periods)
+            is_anomaly = self.is_in_period(file_date.date(), self.anomaly_periods)
+            
+            if not is_normal and not is_anomaly:
+                continue
+            
+            try:
+                if sensor == 'acc':
+                    data = self.load_acc_dat_from_s3(bucket, key)
+                    sampling_rate = 1666.0
+                    
+                    # 데이터를 배치에 추가
+                    for i in range(len(data)):
+                        time_offset = i / sampling_rate
+                        timestamp = file_date + timedelta(seconds=time_offset)
+                        row = (timestamp, machine_id, float(data[i, 0]), float(data[i, 1]), float(data[i, 2]), filename)
+                        
+                        if is_normal:
+                            acc_normal_batch.append(row)
+                        else:
+                            acc_anomaly_batch.append(row)
+                            
+                else:  # mic
+                    data = self.load_mic_dat_from_s3(bucket, key)
+                    sampling_rate = 8000.0
+                    
+                    # 데이터를 배치에 추가
+                    for i in range(len(data)):
+                        time_offset = i / sampling_rate
+                        timestamp = file_date + timedelta(seconds=time_offset)
+                        row = (timestamp, machine_id, int(data[i]), filename)
+                        
+                        if is_normal:
+                            mic_normal_batch.append(row)
+                        else:
+                            mic_anomaly_batch.append(row)
+                            
+            except Exception as e:
+                self.log(f"파일 처리 오류 ({filename}): {str(e)}")
+                continue
         
-        return len(values)
+        return {
+            'acc_normal': acc_normal_batch,
+            'acc_anomaly': acc_anomaly_batch,
+            'mic_normal': mic_normal_batch,
+            'mic_anomaly': mic_anomaly_batch
+        }
     
     def compress_table_chunks(self, table_name):
         """테이블의 압축되지 않은 청크 압축"""
@@ -598,6 +697,11 @@ class S3ToTimescaleDBApp:
     def process_s3_files(self):
         """S3 파일 처리 메인 로직"""
         try:
+            # 성능 설정 업데이트
+            self.batch_size = self.batch_size_var.get()
+            self.max_workers = self.workers_var.get()
+            self.file_batch_size = self.file_batch_var.get()
+            
             bucket = self.bucket_var.get()  # 환경 변수나 입력값에서 가져오기
             machine_id = self.machine_var.get()
             
@@ -632,77 +736,124 @@ class S3ToTimescaleDBApp:
             
             self.log(f"총 {len(all_files)}개 파일 발견")
             
-            # 파일 처리
-            processed = 0
-            normal_count = 0
-            anomaly_count = 0
+            # 통계 초기화
+            self.stats['start_time'] = time.time()
+            self.stats['processed_files'] = 0
+            self.stats['total_records'] = 0
             
-            for i, (sensor, key) in enumerate(all_files):
-                if not self.is_processing:
-                    break
-                
-                filename = os.path.basename(key)
-                file_date = self.parse_filename_date(filename)
-                
-                if not file_date:
-                    self.log(f"날짜 파싱 실패: {filename}")
-                    continue
-                
-                # 정상/비정상 판단
-                is_normal = self.is_in_period(file_date.date(), self.normal_periods)
-                is_anomaly = self.is_in_period(file_date.date(), self.anomaly_periods)
-                
-                if not is_normal and not is_anomaly:
-                    continue  # 지정된 기간에 포함되지 않음
-                
-                try:
-                    # 데이터 로드
-                    if sensor == 'acc':
-                        data = self.load_acc_dat_from_s3(bucket, key)
-                        table = 'normal_acc_data' if is_normal else 'anomaly_acc_data'
-                        inserted = self.insert_acc_data(table, machine_id, filename, file_date, data)
-                    else:  # mic
-                        data = self.load_mic_dat_from_s3(bucket, key)
-                        table = 'normal_mic_data' if is_normal else 'anomaly_mic_data'
-                        inserted = self.insert_mic_data(table, machine_id, filename, file_date, data)
-                    
-                    if is_normal:
-                        normal_count += 1
-                    else:
-                        anomaly_count += 1
-                    
-                    processed += 1
-                    
-                    # 진행률 업데이트
-                    progress = (processed / len(all_files)) * 100
-                    self.progress_var.set(progress)
-                    self.status_label.config(text=f"처리 중: {filename} ({processed}/{len(all_files)})")
-                    
-                    # 로그 (10개마다)
-                    if processed % 10 == 0:
-                        self.log(f"{processed}개 파일 처리 완료 (정상: {normal_count}, 비정상: {anomaly_count})")
-                    
-                    # 100개 파일마다 압축
-                    if processed % 100 == 0:
-                        self.log("청크 압축 중...")
-                        for table_name in ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']:
-                            self.compress_table_chunks(table_name)
-                    
-                except Exception as e:
-                    self.log(f"파일 처리 오류 ({filename}): {str(e)}")
-                    continue
+            # 파일을 배치로 나누기
+            file_batches = [all_files[i:i+self.file_batch_size] 
+                           for i in range(0, len(all_files), self.file_batch_size)]
             
-            # 마지막 압축
+            # ThreadPoolExecutor를 사용한 병렬 처리
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = []
+                
+                for batch_idx, file_batch in enumerate(file_batches):
+                    if not self.is_processing:
+                        break
+                    
+                    future = executor.submit(self.process_file_batch, file_batch, machine_id)
+                    futures.append((batch_idx, future))
+                    
+                # 결과 수집 및 DB 삽입
+                for batch_idx, future in futures:
+                    if not self.is_processing:
+                        break
+                        
+                    try:
+                        result = future.result(timeout=300)  # 5분 타임아웃
+                        
+                        # 배치 데이터 삽입
+                        if result['acc_normal']:
+                            self.insert_acc_data_batch('normal_acc_data', result['acc_normal'])
+                            self.stats['total_records'] += len(result['acc_normal'])
+                            
+                        if result['acc_anomaly']:
+                            self.insert_acc_data_batch('anomaly_acc_data', result['acc_anomaly'])
+                            self.stats['total_records'] += len(result['acc_anomaly'])
+                            
+                        if result['mic_normal']:
+                            self.insert_mic_data_batch('normal_mic_data', result['mic_normal'])
+                            self.stats['total_records'] += len(result['mic_normal'])
+                            
+                        if result['mic_anomaly']:
+                            self.insert_mic_data_batch('anomaly_mic_data', result['mic_anomaly'])
+                            self.stats['total_records'] += len(result['mic_anomaly'])
+                        
+                        # 통계 업데이트
+                        self.stats['processed_files'] += len(file_batch)
+                        
+                        # 주기적 커밋
+                        if batch_idx % 10 == 0:  # 10개 배치마다 커밋
+                            self.db_conn.commit()
+                            
+                        # 진행 상황 업데이트
+                        progress = (self.stats['processed_files'] / len(all_files)) * 100
+                        self.progress_var.set(progress)
+                        
+                        # 처리 속도 계산 및 예상 시간
+                        elapsed = time.time() - self.stats['start_time']
+                        if elapsed > 0:
+                            files_per_sec = self.stats['processed_files'] / elapsed
+                            records_per_sec = self.stats['total_records'] / elapsed
+                            remaining_files = len(all_files) - self.stats['processed_files']
+                            eta = remaining_files / files_per_sec if files_per_sec > 0 else 0
+                            
+                            self.status_label.config(
+                                text=f"처리 중: 배치 {batch_idx+1}/{len(file_batches)} "
+                                     f"({self.stats['processed_files']}/{len(all_files)} 파일)"
+                            )
+                            
+                            self.stats_label.config(
+                                text=f"속도: {files_per_sec:.1f} 파일/초, "
+                                     f"{records_per_sec:.0f} 레코드/초"
+                            )
+                            
+                            eta_hours = int(eta // 3600)
+                            eta_minutes = int((eta % 3600) // 60)
+                            self.eta_label.config(
+                                text=f"예상 남은 시간: {eta_hours}시간 {eta_minutes}분"
+                            )
+                        
+                        # 로그 (배치마다)
+                        if batch_idx % 5 == 0:
+                            self.log(f"배치 {batch_idx+1}/{len(file_batches)} 완료 - "
+                                   f"총 {self.stats['processed_files']} 파일, "
+                                   f"{self.stats['total_records']:,} 레코드 처리")
+                        
+                        # 주기적 압축 (20개 배치마다)
+                        if batch_idx % 20 == 0 and batch_idx > 0:
+                            self.log("청크 압축 중...")
+                            for table_name in ['normal_acc_data', 'normal_mic_data', 
+                                             'anomaly_acc_data', 'anomaly_mic_data']:
+                                self.compress_table_chunks(table_name)
+                                
+                    except Exception as e:
+                        self.log(f"배치 {batch_idx} 처리 오류: {str(e)}")
+                        continue
+            
+            # 최종 커밋 및 압축
+            self.db_conn.commit()
             self.log("최종 압축 중...")
             for table_name in ['normal_acc_data', 'normal_mic_data', 'anomaly_acc_data', 'anomaly_mic_data']:
                 self.compress_table_chunks(table_name)
             
-            self.log(f"\n처리 완료!")
-            self.log(f"총 파일: {processed}")
-            self.log(f"정상 데이터: {normal_count}")
-            self.log(f"비정상 데이터: {anomaly_count}")
+            # 처리 시간 계산
+            total_time = time.time() - self.stats['start_time']
+            hours = int(total_time // 3600)
+            minutes = int((total_time % 3600) // 60)
             
-            messagebox.showinfo("완료", f"처리 완료!\n\n총 파일: {processed}\n정상: {normal_count}\n비정상: {anomaly_count}")
+            self.log(f"\n처리 완료!")
+            self.log(f"총 처리 시간: {hours}시간 {minutes}분")
+            self.log(f"총 파일: {self.stats['processed_files']:,}")
+            self.log(f"총 레코드: {self.stats['total_records']:,}")
+            
+            messagebox.showinfo("완료", 
+                f"처리 완료!\n\n"
+                f"처리 시간: {hours}시간 {minutes}분\n"
+                f"총 파일: {self.stats['processed_files']:,}\n"
+                f"총 레코드: {self.stats['total_records']:,}")
             
         except Exception as e:
             self.log(f"처리 중 오류 발생: {str(e)}")
