@@ -111,12 +111,24 @@ class OCSVMTrainerGUI:
                 user='pdm_user',
                 password='pdm_password'
             )
+            # autocommit 설정으로 트랜잭션 에러 방지
+            self.conn.autocommit = True
             self.log("✅ DB 연결 성공")
+            
+            # 테이블 확인
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name IN ('normal_acc_data', 'normal_mic_data')
+            """)
+            tables = [row[0] for row in cur.fetchall()]
+            self.log(f"확인된 테이블: {tables}")
+            
         except Exception as e:
-            error_msg = f"DB 연결 실패: {str(e)}"
-            self.log(error_msg)
-            messagebox.showerror("DB 연결 실패", error_msg)
-            # DB 연결 실패해도 GUI는 계속 실행
+            self.log(f"DB 연결 실패: {str(e)}")
+            messagebox.showerror("DB 연결 실패", str(e))
     
     def create_widgets(self):
         # 메인 노트북
@@ -288,7 +300,7 @@ class OCSVMTrainerGUI:
             cur = self.conn.cursor()
             cur.execute("""
                 SELECT MIN(DATE(time)), MAX(DATE(time))
-                FROM acc_data
+                FROM normal_acc_data
             """)
             min_date, max_date = cur.fetchone()
             
@@ -419,62 +431,60 @@ class OCSVMTrainerGUI:
         return np.array([mav, rms, peak, amp_iqr])
     
     def get_training_data(self, machine_id, sensor, start_date, end_date):
-        """DB에서 학습 데이터 추출"""
+        """DB에서 학습 데이터 추출 - Python 윈도우 처리"""
         window_sec = self.sensor_config[sensor]['window_sec']
         sampling_rate = self.sensor_config[sensor]['sampling_rate']
         window_samples = window_sec * sampling_rate
         
+        # 먼저 전체 데이터를 가져옴
         if sensor == 'acc':
-            query = f"""
-            WITH windows AS (
-                SELECT 
-                    time_bucket('{window_sec} seconds', time) as window_start,
-                    array_agg(x ORDER BY time) as x_values,
-                    array_agg(y ORDER BY time) as y_values,
-                    array_agg(z ORDER BY time) as z_values,
-                    COUNT(*) as sample_count
-                FROM acc_data
-                WHERE machine_id = %s
-                AND time >= %s AND time <= %s
-                GROUP BY window_start
-                HAVING COUNT(*) >= %s
-            )
-            SELECT * FROM windows ORDER BY window_start
+            query = """
+            SELECT time, x, y, z
+            FROM normal_acc_data
+            WHERE machine_id = %s
+            AND time >= %s AND time <= %s
+            ORDER BY time
             """
         else:  # mic
-            query = f"""
-            WITH windows AS (
-                SELECT 
-                    time_bucket('{window_sec} seconds', time) as window_start,
-                    array_agg(mic_value ORDER BY time) as mic_values,
-                    COUNT(*) as sample_count
-                FROM mic_data
-                WHERE machine_id = %s
-                AND time >= %s AND time <= %s
-                GROUP BY window_start
-                HAVING COUNT(*) >= %s
-            )
-            SELECT * FROM windows ORDER BY window_start
+            query = """
+            SELECT time, mic_value
+            FROM normal_mic_data
+            WHERE machine_id = %s
+            AND time >= %s AND time <= %s
+            ORDER BY time
             """
         
-        self.log(f"쿼리 실행: {machine_id}, {sensor}, {start_date} ~ {end_date}")
+        self.log(f"데이터 추출 중: {machine_id}, {sensor}, {start_date} ~ {end_date}")
         
         df = pd.read_sql(query, self.conn, 
-                        params=(machine_id, start_date, end_date, int(window_samples * 0.8)))
+                        params=(machine_id, start_date, end_date))
         
-        self.log(f"쿼리 결과: {len(df)}개 윈도우")
+        if df.empty:
+            self.log(f"데이터가 없습니다!")
+            return None
         
+        self.log(f"전체 데이터: {len(df)}개 샘플")
+        
+        # Python에서 5초 윈도우로 분할
         features_list = []
-        for _, row in df.iterrows():
-            if sensor == 'acc':
-                features = self.extract_features_acc(
-                    np.array(row['x_values']),
-                    np.array(row['y_values']),
-                    np.array(row['z_values'])
-                )
-            else:
-                features = self.extract_features_mic(np.array(row['mic_values']))
-            features_list.append(features)
+        
+        # 시간을 5초 단위로 그룹화
+        df['window'] = pd.to_datetime(df['time']).dt.floor(f'{window_sec}S')
+        
+        for window, group in df.groupby('window'):
+            if len(group) >= window_samples * 0.8:  # 80% 이상 데이터가 있는 윈도우만
+                if sensor == 'acc':
+                    features = self.extract_features_acc(
+                        group['x'].values,
+                        group['y'].values,
+                        group['z'].values
+                    )
+                else:
+                    features = self.extract_features_mic(group['mic_value'].values)
+                
+                features_list.append(features)
+        
+        self.log(f"추출된 윈도우: {len(features_list)}개")
         
         return np.array(features_list) if features_list else None
     
