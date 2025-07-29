@@ -485,8 +485,7 @@ class S3ToTimescaleDBApp:
                     machine_id TEXT NOT NULL,
                     x DOUBLE PRECISION,
                     y DOUBLE PRECISION,
-                    z DOUBLE PRECISION,
-                    filename TEXT
+                    z DOUBLE PRECISION
                 );
             """)
         
@@ -495,8 +494,7 @@ class S3ToTimescaleDBApp:
                 CREATE TABLE IF NOT EXISTS normal_mic_data (
                     time TIMESTAMPTZ NOT NULL,
                     machine_id TEXT NOT NULL,
-                    mic_value INTEGER,
-                    filename TEXT
+                    mic_value INTEGER
                 );
             """)
         
@@ -633,9 +631,9 @@ class S3ToTimescaleDBApp:
             
             # 테이블에 따라 컬럼 결정
             if 'acc' in table_name:
-                columns = "(time, machine_id, x, y, z, filename)"
+                columns = "(time, machine_id, x, y, z)"
             else:  # mic
-                columns = "(time, machine_id, mic_value, filename)"
+                columns = "(time, machine_id, mic_value)"
             
             # COPY 명령
             cur.copy_expert(
@@ -715,7 +713,7 @@ class S3ToTimescaleDBApp:
                         end_idx = min(i + 10000, n_samples)
                         for j in range(i, end_idx):
                             acc_buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t"
-                                       f"{data[j,0]:.6f}\t{data[j,1]:.6f}\t{data[j,2]:.6f}\t{filename}\n")
+                                       f"{data[j,0]:.6f}\t{data[j,1]:.6f}\t{data[j,2]:.6f}\n")
                     
                     if self.verbose_logging:
                         self.log(f"    - ACC 버퍼에 {n_samples} 레코드 추가")
@@ -743,7 +741,7 @@ class S3ToTimescaleDBApp:
                     for i in range(0, n_samples, 10000):  # 10000개씩 처리
                         end_idx = min(i + 10000, n_samples)
                         for j in range(i, end_idx):
-                            mic_buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t{data[j]}\t{filename}\n")
+                            mic_buffer.write(f"{timestamps[j].isoformat()}\t{machine_id}\t{data[j]}\n")
                     
                     if self.verbose_logging:
                         self.log(f"    - MIC 버퍼에 {n_samples} 레코드 추가")

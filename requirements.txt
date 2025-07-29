@@ -3,3 +3,4 @@ psycopg2-binary
 numpy
 python-dotenv   
 psutil==5.9.8
+optuna==4.2.1
