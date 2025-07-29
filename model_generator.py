@@ -103,6 +103,7 @@ class OCSVMTrainerGUI:
             print(f"[LOG] {message}")  # 로그 위젯이 없을 때 콘솔 출력
     
     def connect_db(self):
+        """DB 연결 - 트랜잭션 에러 방지"""
         try:
             self.conn = psycopg2.connect(
                 host='localhost',
@@ -115,8 +116,10 @@ class OCSVMTrainerGUI:
             self.conn.autocommit = True
             self.log("✅ DB 연결 성공")
             
-            # 테이블 확인
+            # 테이블 및 데이터 확인
             cur = self.conn.cursor()
+            
+            # 테이블 확인
             cur.execute("""
                 SELECT table_name 
                 FROM information_schema.tables 
@@ -125,6 +128,23 @@ class OCSVMTrainerGUI:
             """)
             tables = [row[0] for row in cur.fetchall()]
             self.log(f"확인된 테이블: {tables}")
+            
+            # 각 테이블의 데이터 수 확인
+            for table in tables:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cur.fetchone()[0]
+                self.log(f"{table}: {count:,}개 레코드")
+            
+            # 머신별 데이터 확인
+            for table in tables:
+                cur.execute(f"""
+                    SELECT machine_id, COUNT(*) as cnt, 
+                           MIN(time) as min_time, MAX(time) as max_time
+                    FROM {table}
+                    GROUP BY machine_id
+                """)
+                for row in cur.fetchall():
+                    self.log(f"{table} - {row[0]}: {row[1]:,}개, {row[2]} ~ {row[3]}")
             
         except Exception as e:
             self.log(f"DB 연결 실패: {str(e)}")
@@ -400,43 +420,65 @@ class OCSVMTrainerGUI:
         self.test_periods.clear()
     
     def extract_features_acc(self, x_data, y_data, z_data):
-        """ACC 특징 추출"""
-        features = []
-        
-        # X축
-        x_rms = np.sqrt(np.mean(x_data**2))
-        x_peak = np.max(np.abs(x_data))
-        x_crest = x_peak / x_rms if x_rms > 0 else 0
-        
-        # Y축
-        y_rms = np.sqrt(np.mean(y_data**2))
-        y_peak = np.max(np.abs(y_data))
-        y_crest = y_peak / y_rms if y_rms > 0 else 0
-        
-        # Z축
-        z_rms = np.sqrt(np.mean(z_data**2))
-        z_peak = np.max(np.abs(z_data))
-        z_crest = z_peak / z_rms if z_rms > 0 else 0
-        
-        return np.array([x_peak, x_crest, y_peak, y_crest, z_peak, z_crest])
+        """ACC 특징 추출 - 다운샘플링된 데이터용"""
+        try:
+            # 데이터가 너무 적으면 스킵
+            if len(x_data) < 10:
+                raise ValueError(f"데이터가 너무 적음: {len(x_data)}개")
+            
+            features = []
+            
+            # X축
+            x_rms = np.sqrt(np.mean(x_data**2))
+            x_peak = np.max(np.abs(x_data))
+            x_crest = x_peak / x_rms if x_rms > 1e-10 else 0
+            
+            # Y축
+            y_rms = np.sqrt(np.mean(y_data**2))
+            y_peak = np.max(np.abs(y_data))
+            y_crest = y_peak / y_rms if y_rms > 1e-10 else 0
+            
+            # Z축
+            z_rms = np.sqrt(np.mean(z_data**2))
+            z_peak = np.max(np.abs(z_data))
+            z_crest = z_peak / z_rms if z_rms > 1e-10 else 0
+            
+            return np.array([x_peak, x_crest, y_peak, y_crest, z_peak, z_crest])
+            
+        except Exception as e:
+            self.log(f"ACC 특징 추출 오류: {e}")
+            raise
     
     def extract_features_mic(self, mic_data):
-        """MIC 특징 추출"""
-        mav = np.mean(np.abs(mic_data))
-        rms = np.sqrt(np.mean(mic_data**2))
-        peak = np.max(np.abs(mic_data))
-        q1, q3 = np.percentile(np.abs(mic_data), [25, 75])
-        amp_iqr = q3 - q1
-        
-        return np.array([mav, rms, peak, amp_iqr])
+        """MIC 특징 추출 - 다운샘플링된 데이터용"""
+        try:
+            # 데이터가 너무 적으면 스킵
+            if len(mic_data) < 10:
+                raise ValueError(f"데이터가 너무 적음: {len(mic_data)}개")
+            
+            mav = np.mean(np.abs(mic_data))
+            rms = np.sqrt(np.mean(mic_data**2))
+            peak = np.max(np.abs(mic_data))
+            
+            # IQR 계산 시 데이터가 적으므로 조심
+            q1, q3 = np.percentile(np.abs(mic_data), [25, 75])
+            amp_iqr = q3 - q1
+            
+            return np.array([mav, rms, peak, amp_iqr])
+            
+        except Exception as e:
+            self.log(f"MIC 특징 추출 오류: {e}")
+            raise
     
     def get_training_data(self, machine_id, sensor, start_date, end_date):
-        """DB에서 학습 데이터 추출 - Python 윈도우 처리"""
+        """DB에서 학습 데이터 추출 - 다운샘플링된 데이터 처리"""
         window_sec = self.sensor_config[sensor]['window_sec']
-        sampling_rate = self.sensor_config[sensor]['sampling_rate']
-        window_samples = window_sec * sampling_rate
         
-        # 먼저 전체 데이터를 가져옴
+        # DB에는 1초에 10개씩만 저장되어 있음
+        db_sampling_rate = 10  # 1초에 10개
+        window_samples = window_sec * db_sampling_rate  # 5초 * 10 = 50개
+        
+        # 전체 데이터를 가져옴
         if sensor == 'acc':
             query = """
             SELECT time, x, y, z
@@ -456,37 +498,58 @@ class OCSVMTrainerGUI:
         
         self.log(f"데이터 추출 중: {machine_id}, {sensor}, {start_date} ~ {end_date}")
         
-        df = pd.read_sql(query, self.conn, 
-                        params=(machine_id, start_date, end_date))
-        
-        if df.empty:
-            self.log(f"데이터가 없습니다!")
+        try:
+            df = pd.read_sql(query, self.conn, 
+                            params=(machine_id, start_date, end_date))
+            
+            if df.empty:
+                self.log(f"데이터가 없습니다!")
+                return None
+            
+            self.log(f"전체 데이터: {len(df)}개 샘플")
+            
+            # Python에서 5초 윈도우로 분할
+            features_list = []
+            
+            # 시간을 datetime으로 변환
+            df['time'] = pd.to_datetime(df['time'])
+            
+            # 5초 단위로 그룹화
+            df['window'] = df['time'].dt.floor(f'{window_sec}S')
+            
+            # 윈도우별로 처리
+            window_count = 0
+            for window, group in df.groupby('window'):
+                # 최소 40개 이상 (80%) 데이터가 있는 윈도우만 사용
+                if len(group) >= window_samples * 0.8:  
+                    try:
+                        if sensor == 'acc':
+                            features = self.extract_features_acc(
+                                group['x'].values,
+                                group['y'].values,
+                                group['z'].values
+                            )
+                        else:
+                            features = self.extract_features_mic(group['mic_value'].values)
+                        
+                        features_list.append(features)
+                        window_count += 1
+                        
+                        # 진행 상황 로그 (1000개마다)
+                        if window_count % 1000 == 0:
+                            self.log(f"  처리된 윈도우: {window_count}개")
+                            
+                    except Exception as e:
+                        self.log(f"  윈도우 처리 오류: {e}")
+                        continue
+            
+            self.log(f"추출된 윈도우: {len(features_list)}개")
+            
+            return np.array(features_list) if features_list else None
+            
+        except Exception as e:
+            self.log(f"데이터 추출 오류: {e}")
             return None
-        
-        self.log(f"전체 데이터: {len(df)}개 샘플")
-        
-        # Python에서 5초 윈도우로 분할
-        features_list = []
-        
-        # 시간을 5초 단위로 그룹화
-        df['window'] = pd.to_datetime(df['time']).dt.floor(f'{window_sec}S')
-        
-        for window, group in df.groupby('window'):
-            if len(group) >= window_samples * 0.8:  # 80% 이상 데이터가 있는 윈도우만
-                if sensor == 'acc':
-                    features = self.extract_features_acc(
-                        group['x'].values,
-                        group['y'].values,
-                        group['z'].values
-                    )
-                else:
-                    features = self.extract_features_mic(group['mic_value'].values)
-                
-                features_list.append(features)
-        
-        self.log(f"추출된 윈도우: {len(features_list)}개")
-        
-        return np.array(features_list) if features_list else None
     
     def train_model(self):
         """모델 학습 (별도 스레드에서 실행)"""
