@@ -101,6 +101,9 @@ class OCSVMTrainerGUI:
             self.root.update()
         else:
             print(f"[LOG] {message}")  # 로그 위젯이 없을 때 콘솔 출력
+        
+        # 콘솔에도 항상 출력 (디버깅용)
+        print(f"[{timestamp}] {message}")
     
     def connect_db(self):
         """DB 연결 - 트랜잭션 에러 방지"""
@@ -604,6 +607,7 @@ class OCSVMTrainerGUI:
         self.log(f"데이터 추출 중: {machine_id}, {sensor}, {start_date} ~ {end_date}")
         
         try:
+            start_time = datetime.now()
             df = pd.read_sql(query, self.conn, 
                             params=(machine_id, start_date, end_date))
             
@@ -612,6 +616,7 @@ class OCSVMTrainerGUI:
                 return None
             
             self.log(f"전체 데이터: {len(df)}개 샘플")
+            self.log(f"데이터 로드 시간: {(datetime.now() - start_time).total_seconds():.1f}초")
             
             # Python에서 5초 윈도우로 분할
             features_list = []
@@ -642,13 +647,22 @@ class OCSVMTrainerGUI:
                         
                         # 진행 상황 로그 (1000개마다)
                         if window_count % 1000 == 0:
-                            self.log(f"  처리된 윈도우: {window_count}개")
+                            elapsed = (datetime.now() - start_time).total_seconds()
+                            rate = window_count / elapsed if elapsed > 0 else 0
+                            self.log(f"  처리중: {window_count:,}개 윈도우 ({rate:.0f} windows/sec)")
+                        
+                        # GUI 업데이트 (100개마다)
+                        if window_count % 100 == 0:
+                            self.progress_var.set(f"데이터 추출 중: {start_date} ~ {end_date} ({window_count}개)")
+                            self.root.update_idletasks()
                             
                     except Exception as e:
-                        self.log(f"  윈도우 처리 오류: {e}")
+                        if window_count % 1000 == 0:
+                            self.log(f"  윈도우 처리 오류 발생: {e}")
                         continue
             
-            self.log(f"추출된 윈도우: {len(features_list)}개")
+            total_time = (datetime.now() - start_time).total_seconds()
+            self.log(f"추출 완료: {len(features_list)}개 윈도우 (총 {total_time:.1f}초)")
             
             return np.array(features_list) if features_list else None
             
@@ -659,6 +673,7 @@ class OCSVMTrainerGUI:
     def train_model(self):
         """모델 학습 (별도 스레드에서 실행)"""
         try:
+            total_start_time = datetime.now()
             machine_id = self.machine_var.get()
             sensor = self.sensor_var.get()
             n_trials = self.trials_var.get()
@@ -671,7 +686,10 @@ class OCSVMTrainerGUI:
             all_features = []
             period_info = []  # 각 기간별 정보 저장
             
-            for start, end in self.training_periods:
+            self.log(f"학습 기간: {len(self.training_periods)}개")
+            
+            for idx, (start, end) in enumerate(self.training_periods):
+                self.log(f"\n[{idx+1}/{len(self.training_periods)}] 기간: {start} ~ {end}")
                 self.progress_var.set(f"데이터 추출 중: {start} ~ {end}")
                 features = self.get_training_data(machine_id, sensor, start, end)
                 if features is not None and len(features) > 0:
@@ -682,7 +700,7 @@ class OCSVMTrainerGUI:
                         'end_idx': len(np.vstack(all_features)),
                         'count': len(features)
                     })
-                    self.log(f"✅ {start} ~ {end}: {len(features)}개 윈도우")
+                    self.log(f"✅ 추출 성공: {len(features)}개 윈도우")
             
             if not all_features:
                 self.log("❌ 학습 데이터가 없습니다.")
@@ -690,15 +708,20 @@ class OCSVMTrainerGUI:
                 return
             
             X_train = np.vstack(all_features)
-            self.log(f"전체 학습 데이터: {X_train.shape}")
+            self.log(f"\n전체 학습 데이터: {X_train.shape}")
             
             # 스케일러 학습
+            self.log("\n스케일러 학습 시작...")
             self.progress_var.set("스케일러 학습 중...")
+            scaler_start = datetime.now()
             scaler = CustomRobustScaler()
             X_scaled = scaler.fit_transform(X_train)
-            self.log("✅ 스케일러 학습 완료")
+            scaler_time = (datetime.now() - scaler_start).total_seconds()
+            self.log(f"✅ 스케일러 학습 완료 ({scaler_time:.1f}초)")
             
             # OCSVM 최적화
+            self.log(f"\n하이퍼파라미터 최적화 시작 (Optuna {n_trials} trials)")
+            optuna_start = datetime.now()
             self.progress_var.set(f"하이퍼파라미터 최적화 중... (0/{n_trials})")
             
             opt_config = self.sensor_config[sensor]
@@ -739,6 +762,7 @@ class OCSVMTrainerGUI:
                 X_sample = X_scaled
                 self.log(f"📊 데이터가 충분히 작아 전체 사용: {len(X_scaled)}개")
             
+            trial_count = 0
             # study 변수를 클래스 변수로 만들어 objective 함수에서 접근 가능하게
             self.study = create_study(direction='maximize')
             
@@ -746,6 +770,7 @@ class OCSVMTrainerGUI:
                 # 진행률 업데이트
                 current_trial = len(self.study.trials)
                 self.progress_var.set(f"하이퍼파라미터 최적화 중... ({current_trial}/{n_trials})")
+                self.root.update_idletasks()
                 
                 nu = trial.suggest_float('nu', nu_range[0], nu_range[1], log=True)
                 gamma = trial.suggest_float('gamma', gamma_range[0], gamma_range[1], log=True)
@@ -756,27 +781,61 @@ class OCSVMTrainerGUI:
                 scores = model.decision_function(X_sample)
                 threshold = np.percentile(scores, 5)
                 predictions = (scores > threshold).astype(int)
-                accuracy = np.mean(predictions)
+                score = np.mean(predictions)
                 
-                return accuracy
+                return score
             
-            self.study.optimize(objective, n_trials=n_trials)
+            # Optuna 콜백 함수
+            def optuna_callback(study, trial):
+                nonlocal trial_count
+                trial_count += 1
+                if trial_count % 10 == 0 or trial_count <= 5:
+                    self.log(f"  Trial {trial_count}: nu={trial.params['nu']:.4f}, "
+                            f"gamma={trial.params['gamma']:.6f}, score={trial.value:.4f}")
             
-            best_params = self.study.best_params
-            self.log(f"✅ 최적 파라미터: {best_params}")
+            # 최적화 실행
+            self.study.optimize(objective, n_trials=n_trials, callbacks=[optuna_callback])
             
-            # 최종 모델 학습
+            optuna_time = (datetime.now() - optuna_start).total_seconds()
+            self.log(f"\n✅ 최적화 완료 ({optuna_time:.1f}초)")
+            self.log(f"최적 파라미터: nu={self.study.best_params['nu']:.4f}, "
+                    f"gamma={self.study.best_params['gamma']:.6f}")
+            self.log(f"최적 점수: {self.study.best_value:.4f}")
+            
+            # 최적 모델로 전체 데이터 학습
             self.progress_var.set("최종 모델 학습 중...")
-            model = OneClassSVM(
-                kernel='rbf',
-                nu=best_params['nu'],
-                gamma=best_params['gamma']
-            )
-            model.fit(X_scaled)
+            self.log("\n최종 모델 학습 시작...")
+            best_nu = self.study.best_params['nu']
+            best_gamma = self.study.best_params['gamma']
             
-            # 결정 경계 계산
+            model = OneClassSVM(kernel='rbf', nu=best_nu, gamma=best_gamma)
+            model.fit(X_scaled)
+            self.log("✅ 최종 모델 학습 완료")
+            
+            # 모델 성능 평가
+            self.log("\n모델 성능 평가 중...")
+            predictions = model.predict(X_scaled)
             scores = model.decision_function(X_scaled)
-            decision_boundary = float(np.percentile(scores, 5))
+            
+            anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
+            decision_boundary = np.percentile(scores, 5)  # 하위 5%를 경계로
+            
+            self.log("✅ 학습 완료!")
+            self.log(f"  - 이상치 비율: {anomaly_ratio:.2f}%")
+            self.log(f"  - 결정 경계: {decision_boundary:.4f}")
+            self.log(f"  - 점수 범위: [{np.min(scores):.4f}, {np.max(scores):.4f}]")
+            self.log(f"  - 점수 평균±표준편차: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+            
+            # 기간별 성능 분석
+            self.log("\n📊 기간별 성능:")
+            for info in period_info:
+                start_idx = info['start_idx']
+                end_idx = info['end_idx']
+                period_scores = scores[start_idx:end_idx]
+                period_anomalies = np.sum(predictions[start_idx:end_idx] == -1)
+                period_ratio = period_anomalies / len(period_scores) * 100
+                self.log(f"  - {info['period']}: 이상치 {period_ratio:.1f}% "
+                        f"(점수: {np.mean(period_scores):.3f}±{np.std(period_scores):.3f})")
             
             # 모델 정보
             model_info = {
@@ -785,8 +844,9 @@ class OCSVMTrainerGUI:
                 'train_samples': len(X_train),
                 'training_periods': self.training_periods,
                 'features': self.sensor_config[sensor]['features'],
-                'best_params': best_params,
-                'decision_boundary': decision_boundary,
+                'best_params': self.study.best_params,
+                'decision_boundary': float(decision_boundary),
+                'anomaly_ratio': float(anomaly_ratio),
                 'score_statistics': {
                     'mean': float(np.mean(scores)),
                     'std': float(np.std(scores)),
@@ -797,6 +857,7 @@ class OCSVMTrainerGUI:
             }
             
             # 모델 저장
+            self.log("\n모델 저장 중...")
             timestamp = datetime.now().strftime('%y%m%d_%H%M%S')
             
             # 디렉토리 생성
@@ -829,8 +890,12 @@ class OCSVMTrainerGUI:
             # 현재 모델 정보 저장
             self.current_model_info = model_info
             
+            # 전체 소요 시간
+            total_time = (datetime.now() - total_start_time).total_seconds()
+            self.log(f"\n전체 학습 소요 시간: {total_time:.1f}초 ({total_time/60:.1f}분)")
+            
             self.progress_var.set("학습 완료!")
-            messagebox.showinfo("완료", "모델 학습이 완료되었습니다.")
+            messagebox.showinfo("완료", f"모델 학습이 완료되었습니다.\n머신: {machine_id}\n센서: {sensor}")
             
         except Exception as e:
             self.log(f"❌ 학습 실패: {e}")
