@@ -200,6 +200,12 @@ class OCSVMTrainerGUI:
                                     textvariable=self.trials_var, width=10)
         trials_spinbox.grid(row=row, column=1, padx=5)
         
+        # 성능 평가 스킵 옵션
+        row += 1
+        self.skip_eval_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(config_frame, text="성능 평가 스킵 (빠른 학습)", 
+                       variable=self.skip_eval_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=5)
+        
         # 학습 기간 프레임
         period_frame = ttk.LabelFrame(parent, text="학습 기간 설정", padding="10")
         period_frame.pack(fill='both', expand=True, padx=5, pady=5)
@@ -812,49 +818,294 @@ class OCSVMTrainerGUI:
             model.fit(X_scaled)
             self.log("✅ 최종 모델 학습 완료")
             
-            # 모델 성능 평가
-            self.log("\n모델 성능 평가 중...")
-            predictions = model.predict(X_scaled)
-            scores = model.decision_function(X_scaled)
+            # 모델 성능 평가 (선택적)
+            skip_evaluation = self.skip_eval_var.get()  # GUI 체크박스 값 사용
             
-            anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
-            decision_boundary = np.percentile(scores, 5)  # 하위 5%를 경계로
-            
-            self.log("✅ 학습 완료!")
-            self.log(f"  - 이상치 비율: {anomaly_ratio:.2f}%")
-            self.log(f"  - 결정 경계: {decision_boundary:.4f}")
-            self.log(f"  - 점수 범위: [{np.min(scores):.4f}, {np.max(scores):.4f}]")
-            self.log(f"  - 점수 평균±표준편차: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
-            
-            # 기간별 성능 분석
-            self.log("\n📊 기간별 성능:")
-            for info in period_info:
-                start_idx = info['start_idx']
-                end_idx = info['end_idx']
-                period_scores = scores[start_idx:end_idx]
-                period_anomalies = np.sum(predictions[start_idx:end_idx] == -1)
-                period_ratio = period_anomalies / len(period_scores) * 100
-                self.log(f"  - {info['period']}: 이상치 {period_ratio:.1f}% "
-                        f"(점수: {np.mean(period_scores):.3f}±{np.std(period_scores):.3f})")
-            
-            # 모델 정보
-            model_info = {
-                'machine_id': machine_id,
-                'sensor': sensor,
-                'train_samples': len(X_train),
-                'training_periods': self.training_periods,
-                'features': self.sensor_config[sensor]['features'],
-                'best_params': self.study.best_params,
-                'decision_boundary': float(decision_boundary),
-                'anomaly_ratio': float(anomaly_ratio),
-                'score_statistics': {
-                    'mean': float(np.mean(scores)),
-                    'std': float(np.std(scores)),
-                    'min': float(np.min(scores)),
-                    'max': float(np.max(scores))
-                },
-                'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
+            if skip_evaluation:
+                self.log("\n⚡ 성능 평가 단계 스킵 (빠른 학습 모드)")
+                # 간단한 샘플링으로 대략적인 성능만 확인
+                sample_size = min(10000, len(X_scaled))
+                sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
+                sample_scores = model.decision_function(X_scaled[sample_indices])
+                decision_boundary = np.percentile(sample_scores, 5)
+                
+                model_info = {
+                    'machine_id': machine_id,
+                    'sensor': sensor,
+                    'train_samples': len(X_train),
+                    'training_periods': self.training_periods,
+                    'features': self.sensor_config[sensor]['features'],
+                    'best_params': self.study.best_params,
+                    'decision_boundary': float(decision_boundary),
+                    'evaluation_skipped': True,
+                    'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            else:
+                # 전체 성능 평가 (배치 처리)
+                self.log("\n모델 성능 평가 중...")
+                eval_start = datetime.now()
+                
+                batch_size = 10000
+                predictions = []
+                scores = []
+                
+                self.log(f"전체 {len(X_scaled):,}개 데이터에 대해 예측 수행 (배치 크기: {batch_size:,})")
+                
+                for i in range(0, len(X_scaled), batch_size):
+                    batch_end = min(i + batch_size, len(X_scaled))
+                    batch = X_scaled[i:batch_end]
+                    
+                    # 배치 예측
+                    batch_predictions = model.predict(batch)
+                    batch_scores = model.decision_function(batch)
+                    
+                    predictions.extend(batch_predictions)
+                    scores.extend(batch_scores)
+                    
+                    # 진행 상황 로그 (10개 배치마다)
+                    if (i // batch_size + 1) % 10 == 0 or batch_end == len(X_scaled):
+                        progress = batch_end / len(X_scaled) * 100
+                        elapsed = (datetime.now() - eval_start).total_seconds()
+                        rate = batch_end / elapsed if elapsed > 0 else 0
+                        eta = (len(X_scaled) - batch_end) / rate if rate > 0 else 0
+                        
+                        self.log(f"  예측 진행: {batch_end:,}/{len(X_scaled):,} ({progress:.1f}%) "
+                                f"- {rate:.0f} samples/sec, ETA: {eta:.0f}초")
+                        self.progress_var.set(f"성능 평가 중... {progress:.1f}%")
+                        self.root.update_idletasks()
+                
+                # numpy 배열로 변환
+                predictions = np.array(predictions)
+                scores = np.array(scores)
+                
+                eval_time = (datetime.now() - eval_start).total_seconds()
+                self.log(f"✅ 예측 완료 ({eval_time:.1f}초)")
+                
+                # 성능 지표 계산
+                self.log("\n성능 지표 계산 중...")
+                anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
+                decision_boundary = float(np.percentile(scores, 5))
+                
+                self.log(f"✅ 학습 완료!")
+                self.log(f"  - 이상치 비율: {anomaly_ratio:.2f}%")
+                self.log(f"  - 결정 경계: {decision_boundary:.4f}")
+                self.log(f"  - 점수 범위: [{np.min(scores):.4f}, {np.max(scores):.4f}]")
+                self.log(f"  - 점수 평균±표준편차: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+                
+                # 기간별 성능 분석
+                self.log("\n📊 기간별 성능:")
+                for info in period_info:
+                    start_idx = info['start_idx']
+                    end_idx = info['end_idx']
+                    period_scores = scores[start_idx:end_idx]
+                    period_predictions = predictions[start_idx:end_idx]
+                    period_anomaly_ratio = np.sum(period_predictions == -1) / len(period_predictions) * 100
+                    
+                    self.log(f"  - {info['period']}: 이상 {period_anomaly_ratio:.1f}%, "
+                            f"점수 {np.mean(period_scores):.2f}±{np.std(period_scores):.2f}")
+                
+                # 2차 로직을 위한 상세 통계 분석
+                self.log("\n📊 2차 로직 경계값 설정을 위한 분석:")
+                
+                # 정상/이상 데이터 분리
+                normal_scores = scores[predictions == 1]
+                anomaly_scores = scores[predictions == -1]
+                
+                # 퍼센타일 기반 경계값 후보
+                percentiles = [0.1, 0.5, 1, 2, 3, 5, 10, 15, 20]
+                percentile_values = {}
+                
+                self.log("\n  정상 데이터 점수 분포:")
+                self.log(f"    - 개수: {len(normal_scores):,}개 ({len(normal_scores)/len(scores)*100:.1f}%)")
+                self.log(f"    - 평균±표준편차: {np.mean(normal_scores):.2f} ± {np.std(normal_scores):.2f}")
+                self.log(f"    - 최소/최대: {np.min(normal_scores):.2f} / {np.max(normal_scores):.2f}")
+                
+                self.log("\n  이상 데이터 점수 분포:")
+                self.log(f"    - 개수: {len(anomaly_scores):,}개 ({len(anomaly_scores)/len(scores)*100:.1f}%)")
+                self.log(f"    - 평균±표준편차: {np.mean(anomaly_scores):.2f} ± {np.std(anomaly_scores):.2f}")
+                self.log(f"    - 최소/최대: {np.min(anomaly_scores):.2f} / {np.max(anomaly_scores):.2f}")
+                
+                self.log("\n  전체 점수 퍼센타일:")
+                for p in percentiles:
+                    val = np.percentile(scores, p)
+                    percentile_values[f"p{p}"] = float(val)
+                    self.log(f"    - {p:5.1f}%: {val:8.2f}")
+                
+                # 점수 구간별 분포
+                self.log("\n  점수 구간별 분포:")
+                score_ranges = [
+                    (-np.inf, -100, "극심한 이상"),
+                    (-100, -50, "심각한 이상"),
+                    (-50, -20, "중간 이상"),
+                    (-20, -10, "경미한 이상"),
+                    (-10, 0, "의심 구간"),
+                    (0, 100, "정상 범위"),
+                    (100, np.inf, "매우 정상")
+                ]
+                
+                score_distribution = {}
+                self.log("    [전체 데이터]")
+                for min_score, max_score, label in score_ranges:
+                    count = np.sum((scores >= min_score) & (scores < max_score))
+                    ratio = count / len(scores) * 100
+                    self.log(f"    - {label:12s} [{min_score:6.0f} ~ {max_score:6.0f}]: "
+                            f"{count:6,}개 ({ratio:5.1f}%)")
+                
+                # 정상 데이터의 점수 구간별 분포
+                self.log("\n    [정상으로 분류된 데이터]")
+                normal_distribution = {}
+                for min_score, max_score, label in score_ranges:
+                    count = np.sum((normal_scores >= min_score) & (normal_scores < max_score))
+                    ratio = count / len(normal_scores) * 100 if len(normal_scores) > 0 else 0
+                    normal_distribution[label] = {
+                        'count': int(count),
+                        'ratio': float(ratio),
+                        'range': [float(min_score) if min_score != -np.inf else None,
+                                 float(max_score) if max_score != np.inf else None]
+                    }
+                    if count > 0:
+                        self.log(f"    - {label:12s} [{min_score:6.0f} ~ {max_score:6.0f}]: "
+                                f"{count:6,}개 ({ratio:5.1f}%)")
+                
+                # 이상 데이터의 점수 구간별 분포
+                self.log("\n    [이상으로 분류된 데이터]")
+                anomaly_distribution = {}
+                for min_score, max_score, label in score_ranges:
+                    count = np.sum((anomaly_scores >= min_score) & (anomaly_scores < max_score))
+                    ratio = count / len(anomaly_scores) * 100 if len(anomaly_scores) > 0 else 0
+                    anomaly_distribution[label] = {
+                        'count': int(count),
+                        'ratio': float(ratio),
+                        'range': [float(min_score) if min_score != -np.inf else None,
+                                 float(max_score) if max_score != np.inf else None]
+                    }
+                    if count > 0:
+                        self.log(f"    - {label:12s} [{min_score:6.0f} ~ {max_score:6.0f}]: "
+                                f"{count:6,}개 ({ratio:5.1f}%)")
+                
+                # 전체 통합 분포
+                for min_score, max_score, label in score_ranges:
+                    total_count = np.sum((scores >= min_score) & (scores < max_score))
+                    normal_count = np.sum((normal_scores >= min_score) & (normal_scores < max_score))
+                    anomaly_count = np.sum((anomaly_scores >= min_score) & (anomaly_scores < max_score))
+                    
+                    score_distribution[label] = {
+                        'total': {
+                            'count': int(total_count),
+                            'ratio': float(total_count / len(scores) * 100)
+                        },
+                        'normal': {
+                            'count': int(normal_count),
+                            'ratio': float(normal_count / len(normal_scores) * 100) if len(normal_scores) > 0 else 0,
+                            'of_total': float(normal_count / total_count * 100) if total_count > 0 else 0
+                        },
+                        'anomaly': {
+                            'count': int(anomaly_count),
+                            'ratio': float(anomaly_count / len(anomaly_scores) * 100) if len(anomaly_scores) > 0 else 0,
+                            'of_total': float(anomaly_count / total_count * 100) if total_count > 0 else 0
+                        },
+                        'range': [float(min_score) if min_score != -np.inf else None,
+                                 float(max_score) if max_score != np.inf else None]
+                    }
+                
+                # 교차 분석
+                self.log("\n  📊 정상/이상 교차 분석:")
+                
+                # 정상으로 분류되었지만 점수가 낮은 데이터
+                normal_but_low_score = np.sum(normal_scores < 0)
+                if normal_but_low_score > 0:
+                    self.log(f"    - 정상 분류지만 점수 < 0: {normal_but_low_score:,}개 "
+                            f"({normal_but_low_score/len(normal_scores)*100:.1f}%)")
+                    
+                    # 상세 분포
+                    for threshold in [-10, -20, -50, -100]:
+                        count = np.sum(normal_scores < threshold)
+                        if count > 0:
+                            self.log(f"      • 점수 < {threshold}: {count:,}개 "
+                                    f"({count/len(normal_scores)*100:.2f}%)")
+                
+                # 이상으로 분류되었지만 점수가 높은 데이터
+                if len(anomaly_scores) > 0:
+                    anomaly_but_high_score = np.sum(anomaly_scores > 0)
+                    if anomaly_but_high_score > 0:
+                        self.log(f"    - 이상 분류지만 점수 > 0: {anomaly_but_high_score:,}개 "
+                                f"({anomaly_but_high_score/len(anomaly_scores)*100:.1f}%)")
+                
+                # 경계 근처 데이터 분석
+                boundary_range = 10  # 결정 경계 ±10
+                near_boundary = np.sum(np.abs(scores - decision_boundary) < boundary_range)
+                self.log(f"    - 결정 경계({decision_boundary:.2f}) ±{boundary_range} 범위: "
+                        f"{near_boundary:,}개 ({near_boundary/len(scores)*100:.1f}%)")
+                
+                # 2차 로직 경계값 추천
+                self.log("\n  💡 2차 로직 경계값 추천:")
+                
+                # 방법 1: 정상 데이터의 하위 퍼센타일
+                normal_lower_bound = np.percentile(normal_scores, 1)  # 정상의 하위 1%
+                self.log(f"    - 정상 데이터 하위 1%: {normal_lower_bound:.2f}")
+                
+                # 방법 2: 전체 데이터의 특정 퍼센타일
+                overall_p3 = np.percentile(scores, 3)
+                self.log(f"    - 전체 데이터 하위 3%: {overall_p3:.2f}")
+                
+                # 방법 3: 평균 - n*표준편차
+                mean_minus_2std = np.mean(scores) - 2 * np.std(scores)
+                mean_minus_3std = np.mean(scores) - 3 * np.std(scores)
+                self.log(f"    - 평균 - 2σ: {mean_minus_2std:.2f}")
+                self.log(f"    - 평균 - 3σ: {mean_minus_3std:.2f}")
+                
+                # 방법 4: 이상 데이터의 상위 경계
+                if len(anomaly_scores) > 0:
+                    anomaly_upper = np.percentile(anomaly_scores, 90)  # 이상의 상위 10%
+                    self.log(f"    - 이상 데이터 상위 10%: {anomaly_upper:.2f}")
+                
+                # 모델 정보
+                model_info = {
+                    'machine_id': machine_id,
+                    'sensor': sensor,
+                    'train_samples': len(X_train),
+                    'training_periods': self.training_periods,
+                    'features': self.sensor_config[sensor]['features'],
+                    'best_params': self.study.best_params,
+                    'decision_boundary': float(decision_boundary),
+                    'anomaly_ratio': float(anomaly_ratio),
+                    'score_statistics': {
+                        'mean': float(np.mean(scores)),
+                        'std': float(np.std(scores)),
+                        'min': float(np.min(scores)),
+                        'max': float(np.max(scores))
+                    },
+                    'normal_score_statistics': {
+                        'count': int(len(normal_scores)),
+                        'mean': float(np.mean(normal_scores)),
+                        'std': float(np.std(normal_scores)),
+                        'min': float(np.min(normal_scores)),
+                        'max': float(np.max(normal_scores)),
+                        'percentiles': {
+                            'p1': float(np.percentile(normal_scores, 1)),
+                            'p5': float(np.percentile(normal_scores, 5)),
+                            'p10': float(np.percentile(normal_scores, 10))
+                        }
+                    },
+                    'anomaly_score_statistics': {
+                        'count': int(len(anomaly_scores)),
+                        'mean': float(np.mean(anomaly_scores)) if len(anomaly_scores) > 0 else None,
+                        'std': float(np.std(anomaly_scores)) if len(anomaly_scores) > 0 else None,
+                        'min': float(np.min(anomaly_scores)) if len(anomaly_scores) > 0 else None,
+                        'max': float(np.max(anomaly_scores)) if len(anomaly_scores) > 0 else None
+                    },
+                    'score_percentiles': percentile_values,
+                    'score_distribution': score_distribution,
+                    'secondary_thresholds': {
+                        'normal_p1': float(normal_lower_bound),
+                        'overall_p3': float(overall_p3),
+                        'mean_minus_2std': float(mean_minus_2std),
+                        'mean_minus_3std': float(mean_minus_3std),
+                        'anomaly_p90': float(anomaly_upper) if len(anomaly_scores) > 0 else None
+                    },
+                    'evaluation_skipped': False,
+                    'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
             
             # 모델 저장
             self.log("\n모델 저장 중...")
@@ -986,6 +1237,15 @@ class OCSVMTrainerGUI:
                 predictions = model.predict(X_test_scaled)
                 scores = model.decision_function(X_test_scaled)
                 
+                # 시간대별 분석을 위한 데이터 준비
+                self.log(f"\n{test_date} 시간대별 분석 중...")
+                
+                # 원본 데이터에 예측 결과 추가
+                hourly_stats = self.analyze_hourly_anomalies(
+                    machine_id, sensor, test_date, 
+                    predictions, scores
+                )
+                
                 # 결과 분석
                 anomaly_count = np.sum(predictions == -1)
                 anomaly_ratio = anomaly_count / len(predictions) * 100
@@ -1006,11 +1266,100 @@ class OCSVMTrainerGUI:
                     below_boundary = np.sum(scores < boundary)
                     self.result_text.insert(tk.END, f"  - 점수 < {boundary:.3f} (결정경계): {below_boundary}개\n")
                 
+                # 시간대별 이상 탐지 결과
+                if hourly_stats:
+                    self.result_text.insert(tk.END, "\n  시간대별 이상 탐지:\n")
+                    for hour, stats in hourly_stats.items():
+                        if stats['anomaly_count'] > 0:
+                            self.result_text.insert(
+                                tk.END, 
+                                f"    {hour:02d}시: {stats['anomaly_count']}개/"
+                                f"{stats['total_count']}개 ({stats['anomaly_ratio']:.1f}%), "
+                                f"점수: {stats['mean_score']:.2f}\n"
+                            )
+                    
+                    # 이상이 가장 많이 발생한 시간대
+                    peak_hour = max(hourly_stats.items(), 
+                                  key=lambda x: x[1]['anomaly_count'])[0]
+                    self.result_text.insert(tk.END, 
+                                          f"  - 이상 최다 발생 시간: {peak_hour}시\n")
+                
             self.result_text.insert(tk.END, f"\n{'='*60}\n")
             self.result_text.insert(tk.END, "테스트 완료\n")
             
         except Exception as e:
             messagebox.showerror("오류", f"테스트 중 오류 발생: {e}")
+    
+    def analyze_hourly_anomalies(self, machine_id, sensor, test_date, predictions, scores):
+        """시간대별 이상 탐지 분석"""
+        try:
+            # 해당 날짜의 원본 데이터 다시 로드 (시간 정보 포함)
+            if sensor == 'acc':
+                query = """
+                SELECT time, x, y, z
+                FROM normal_acc_data
+                WHERE machine_id = %s
+                AND DATE(time) = %s
+                ORDER BY time
+                """
+            else:
+                query = """
+                SELECT time, mic_value
+                FROM normal_mic_data
+                WHERE machine_id = %s
+                AND DATE(time) = %s
+                ORDER BY time
+                """
+            
+            df = pd.read_sql(query, self.conn, params=(machine_id, test_date))
+            df['time'] = pd.to_datetime(df['time'])
+            
+            # 5초 윈도우로 그룹화 (학습과 동일)
+            window_sec = self.sensor_config[sensor]['window_sec']
+            df['window'] = df['time'].dt.floor(f'{window_sec}S')
+            df['hour'] = df['time'].dt.hour
+            
+            # 각 윈도우의 시간대 할당
+            window_hours = df.groupby('window')['hour'].first().values
+            
+            # 최소 데이터 요구사항을 만족하는 윈도우만 필터링
+            window_samples = window_sec * 10  # DB는 10Hz
+            valid_windows = df.groupby('window').size() >= window_samples * 0.8
+            valid_indices = valid_windows[valid_windows].index
+            
+            # 유효한 윈도우의 인덱스 찾기
+            window_idx = 0
+            hourly_predictions = {h: [] for h in range(24)}
+            hourly_scores = {h: [] for h in range(24)}
+            
+            for window in valid_indices:
+                if window_idx < len(predictions):
+                    hour = df[df['window'] == window]['hour'].iloc[0]
+                    hourly_predictions[hour].append(predictions[window_idx])
+                    hourly_scores[hour].append(scores[window_idx])
+                    window_idx += 1
+            
+            # 시간대별 통계 계산
+            hourly_stats = {}
+            for hour in range(24):
+                if hourly_predictions[hour]:
+                    anomaly_count = sum(p == -1 for p in hourly_predictions[hour])
+                    total_count = len(hourly_predictions[hour])
+                    
+                    hourly_stats[hour] = {
+                        'anomaly_count': anomaly_count,
+                        'total_count': total_count,
+                        'anomaly_ratio': anomaly_count / total_count * 100,
+                        'mean_score': np.mean(hourly_scores[hour]),
+                        'min_score': np.min(hourly_scores[hour]),
+                        'max_score': np.max(hourly_scores[hour])
+                    }
+            
+            return hourly_stats
+            
+        except Exception as e:
+            self.log(f"시간대별 분석 오류: {e}")
+            return None
     
     def start_testing(self):
         if not self.test_periods:
