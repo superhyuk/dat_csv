@@ -440,6 +440,28 @@ class OCSVMTrainerGUI:
         except Exception as e:
             self.log(f"데이터 확인 실패: {e}")
     
+    def stratified_time_sampling(self, X_scaled, period_info, target_size):
+        """시간대별 균등 샘플링"""
+        sample_indices = []
+        
+        # 각 기간을 시간대별로 나누기
+        for info in period_info:
+            period_data_count = info['count']
+            period_sample_size = int(target_size * (period_data_count / len(X_scaled)))
+            
+            if period_sample_size > 0:
+                # 하루를 4개 시간대로 나누기 (6시간 단위)
+                # 또는 피크/오프피크 시간대로 나누기
+                period_start = info['start_idx']
+                period_end = info['end_idx']
+                
+                # 균등 간격으로 샘플링
+                indices = np.linspace(period_start, period_end-1, 
+                                    period_sample_size, dtype=int)
+                sample_indices.extend(indices)
+        
+        return np.array(sample_indices)
+    
     def add_training_period(self):
         try:
             start = self.train_start_date.get()
@@ -647,11 +669,19 @@ class OCSVMTrainerGUI:
             
             # 학습 데이터 수집
             all_features = []
+            period_info = []  # 각 기간별 정보 저장
+            
             for start, end in self.training_periods:
                 self.progress_var.set(f"데이터 추출 중: {start} ~ {end}")
                 features = self.get_training_data(machine_id, sensor, start, end)
                 if features is not None and len(features) > 0:
                     all_features.append(features)
+                    period_info.append({
+                        'period': f"{start} ~ {end}",
+                        'start_idx': len(np.vstack(all_features[:-1])) if len(all_features) > 1 else 0,
+                        'end_idx': len(np.vstack(all_features)),
+                        'count': len(features)
+                    })
                     self.log(f"✅ {start} ~ {end}: {len(features)}개 윈도우")
             
             if not all_features:
@@ -675,6 +705,40 @@ class OCSVMTrainerGUI:
             nu_range = opt_config['nu_range']
             gamma_range = opt_config['gamma_range']
             
+            # 시간적 분포를 고려한 계층적 샘플링
+            target_sample_size = min(20000, int(len(X_scaled) * 0.1))  # 최대 20,000개
+            
+            if target_sample_size < len(X_scaled):
+                self.log(f"\n📊 계층적 샘플링 시작: {len(X_scaled)}개 → {target_sample_size}개")
+                
+                sample_indices = []
+                
+                # 각 기간별로 비례적으로 샘플링
+                for info in period_info:
+                    period_ratio = info['count'] / len(X_scaled)
+                    period_sample_size = int(target_sample_size * period_ratio)
+                    
+                    if period_sample_size > 0:
+                        # 해당 기간 내에서 균등하게 샘플링
+                        period_indices = np.arange(info['start_idx'], info['end_idx'])
+                        
+                        if period_sample_size < len(period_indices):
+                            # 시간 간격을 두고 균등하게 선택
+                            step = len(period_indices) // period_sample_size
+                            selected = period_indices[::step][:period_sample_size]
+                        else:
+                            selected = period_indices
+                        
+                        sample_indices.extend(selected)
+                        self.log(f"  - {info['period']}: {len(selected)}개 샘플")
+                
+                sample_indices = np.array(sample_indices)
+                X_sample = X_scaled[sample_indices]
+                self.log(f"✅ 총 {len(X_sample)}개 샘플 추출 완료")
+            else:
+                X_sample = X_scaled
+                self.log(f"📊 데이터가 충분히 작아 전체 사용: {len(X_scaled)}개")
+            
             # study 변수를 클래스 변수로 만들어 objective 함수에서 접근 가능하게
             self.study = create_study(direction='maximize')
             
@@ -687,9 +751,9 @@ class OCSVMTrainerGUI:
                 gamma = trial.suggest_float('gamma', gamma_range[0], gamma_range[1], log=True)
                 
                 model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma)
-                model.fit(X_scaled)
+                model.fit(X_sample)
                 
-                scores = model.decision_function(X_scaled)
+                scores = model.decision_function(X_sample)
                 threshold = np.percentile(scores, 5)
                 predictions = (scores > threshold).astype(int)
                 accuracy = np.mean(predictions)
