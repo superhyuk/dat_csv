@@ -716,14 +716,40 @@ class OCSVMTrainerGUI:
             X_train = np.vstack(all_features)
             self.log(f"\n전체 학습 데이터: {X_train.shape}")
             
-            # 스케일러 학습
+            # 스케일러 학습 (fit만 수행)
             self.log("\n스케일러 학습 시작...")
             self.progress_var.set("스케일러 학습 중...")
             scaler_start = datetime.now()
             scaler = CustomRobustScaler()
-            X_scaled = scaler.fit_transform(X_train)
+            scaler.fit(X_train)  # 전체 데이터로 범위만 학습
             scaler_time = (datetime.now() - scaler_start).total_seconds()
             self.log(f"✅ 스케일러 학습 완료 ({scaler_time:.1f}초)")
+            
+            # 개별 윈도우 스케일링 함수
+            def scale_windows_individually(X, scaler, progress_callback=None):
+                """각 윈도우를 개별적으로 스케일링"""
+                X_scaled = []
+                for i in range(len(X)):
+                    scaled = scaler.transform(X[i].reshape(1, -1))
+                    X_scaled.append(scaled[0])
+                    if progress_callback and i % 10000 == 0:
+                        progress_callback(i, len(X))
+                return np.array(X_scaled)
+            
+            # 전체 데이터 개별 스케일링
+            self.log("\n전체 데이터 개별 윈도우 스케일링 시작...")
+            self.progress_var.set("데이터 스케일링 중...")
+            
+            def scaling_progress(current, total):
+                if current > 0:
+                    self.log(f"  스케일링 진행: {current:,}/{total:,} ({current/total*100:.1f}%)")
+                    self.progress_var.set(f"스케일링 중... {current/total*100:.1f}%")
+                    self.root.update_idletasks()
+            
+            scaling_start = datetime.now()
+            X_scaled = scale_windows_individually(X_train, scaler, scaling_progress)
+            scaling_time = (datetime.now() - scaling_start).total_seconds()
+            self.log(f"✅ 개별 윈도우 스케일링 완료 ({scaling_time:.1f}초, {len(X_scaled)/scaling_time:.0f} windows/sec)")
             
             # 🔍 디버깅: 원본 데이터와 스케일된 데이터 비교
             self.log("\n🔍 [디버깅] 데이터 스케일링 검증:")
@@ -784,7 +810,10 @@ class OCSVMTrainerGUI:
                         self.log(f"  - {info['period']}: {len(selected)}개 샘플")
                 
                 sample_indices = np.array(sample_indices)
-                X_sample = X_scaled[sample_indices]
+                
+                # 샘플링된 윈도우들만 개별 스케일링
+                self.log(f"\n샘플링된 데이터 스케일링 중...")
+                X_sample = scale_windows_individually(X_train[sample_indices], scaler)
                 self.log(f"✅ 총 {len(X_sample)}개 샘플 추출 완료")
             else:
                 X_sample = X_scaled
@@ -1334,7 +1363,14 @@ class OCSVMTrainerGUI:
                     continue
                 
                 # 예측
-                X_test_scaled = scaler.transform(test_data)
+                # 각 윈도우별로 개별 스케일링
+                self.log(f"테스트 데이터 개별 스케일링 중...")
+                X_test_scaled = []
+                for i in range(len(test_data)):
+                    scaled = scaler.transform(test_data[i].reshape(1, -1))
+                    X_test_scaled.append(scaled[0])
+                X_test_scaled = np.array(X_test_scaled)
+                
                 self.log(f"✅ 테스트 데이터 정규화 완료: {X_test_scaled.shape}")
                 
                 # 🔍 디버깅: 테스트 데이터 스케일 확인
