@@ -725,6 +725,28 @@ class OCSVMTrainerGUI:
             scaler_time = (datetime.now() - scaler_start).total_seconds()
             self.log(f"✅ 스케일러 학습 완료 ({scaler_time:.1f}초)")
             
+            # 🔍 디버깅: 원본 데이터와 스케일된 데이터 비교
+            self.log("\n🔍 [디버깅] 데이터 스케일링 검증:")
+            for i, feature_name in enumerate(self.sensor_config[sensor]['features']):
+                self.log(f"\n  [{feature_name}]")
+                self.log(f"    원본 - min: {X_train[:, i].min():.2f}, max: {X_train[:, i].max():.2f}, "
+                        f"mean: {X_train[:, i].mean():.2f}, std: {X_train[:, i].std():.2f}")
+                self.log(f"    스케일 - min: {X_scaled[:, i].min():.2f}, max: {X_scaled[:, i].max():.2f}, "
+                        f"mean: {X_scaled[:, i].mean():.2f}, std: {X_scaled[:, i].std():.2f}")
+                
+                # 스케일러 파라미터 확인
+                self.log(f"    스케일러 - median: {scaler.params[i]['median']:.2f}, "
+                        f"IQR: {scaler.params[i]['iqr']:.2f}")
+            
+            # 🔍 전체 스케일된 데이터 통계
+            self.log(f"\n🔍 [디버깅] 전체 스케일된 데이터:")
+            self.log(f"  - 범위: [{X_scaled.min():.4f}, {X_scaled.max():.4f}]")
+            self.log(f"  - 평균: {X_scaled.mean():.4f}")
+            self.log(f"  - 표준편차: {X_scaled.std():.4f}")
+            self.log(f"  - 중앙값: {np.median(X_scaled):.4f}")
+            self.log(f"  - 95% 범위: [{np.percentile(X_scaled, 2.5):.4f}, "
+                    f"{np.percentile(X_scaled, 97.5):.4f}]")
+            
             # OCSVM 최적화
             self.log(f"\n하이퍼파라미터 최적화 시작 (Optuna {n_trials} trials)")
             optuna_start = datetime.now()
@@ -818,8 +840,23 @@ class OCSVMTrainerGUI:
             model.fit(X_scaled)
             self.log("✅ 최종 모델 학습 완료")
             
+            # 🔍 디버깅: 모델 정보
+            self.log(f"\n🔍 [디버깅] 모델 정보:")
+            self.log(f"  - Support vectors: {model.support_vectors_.shape[0]}개")
+            self.log(f"  - Dual coefficients 범위: [{model.dual_coef_.min():.4f}, "
+                    f"{model.dual_coef_.max():.4f}]")
+            if hasattr(model, 'offset_'):
+                self.log(f"  - Offset: {model.offset_[0]:.4f}")
+            
             # 모델 성능 평가 (선택적)
             skip_evaluation = self.skip_eval_var.get()  # GUI 체크박스 값 사용
+            
+            # 🔍 항상 작은 샘플로 score 분포 확인
+            sample_size = min(1000, len(X_scaled))
+            sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
+            debug_scores = model.decision_function(X_scaled[sample_indices])
+            self.log(f"\n🔍 [디버깅] 샘플 {sample_size}개의 score 분포:")
+            self.log(f"  - 범위: [{debug_scores.min():.2f}, {debug_scores.max():.2f}]")
             
             if skip_evaluation:
                 self.log("\n⚡ 성능 평가 단계 스킵 (빠른 학습 모드)")
@@ -827,7 +864,18 @@ class OCSVMTrainerGUI:
                 sample_size = min(10000, len(X_scaled))
                 sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
                 sample_scores = model.decision_function(X_scaled[sample_indices])
-                decision_boundary = np.percentile(sample_scores, 5)
+                # IQR 방식 사용
+                q1, q3 = np.percentile(sample_scores, [25, 75])
+                iqr = q3 - q1
+                decision_boundary = q1 - 3 * iqr
+                
+                # 🔍 디버깅: boundary 계산 과정
+                self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
+                self.log(f"  - Score 분포: min={sample_scores.min():.2f}, max={sample_scores.max():.2f}")
+                self.log(f"  - Q1: {q1:.2f}")
+                self.log(f"  - Q3: {q3:.2f}")
+                self.log(f"  - IQR: {iqr:.2f}")
+                self.log(f"  - Boundary = Q1 - 3*IQR = {q1:.2f} - 3*{iqr:.2f} = {decision_boundary:.2f}")
                 
                 model_info = {
                     'machine_id': machine_id,
@@ -837,6 +885,12 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
+                    'boundary_method': 'IQR',
+                    'boundary_stats': {
+                        'q1': float(q1),
+                        'q3': float(q3),
+                        'iqr': float(iqr)
+                    },
                     'evaluation_skipped': True,
                     'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
@@ -881,10 +935,30 @@ class OCSVMTrainerGUI:
                 eval_time = (datetime.now() - eval_start).total_seconds()
                 self.log(f"✅ 예측 완료 ({eval_time:.1f}초)")
                 
-                # 성능 지표 계산
-                self.log("\n성능 지표 계산 중...")
+                # 결정 경계 계산
+                self.log("\n결정 경계 계산 중...")
+                # IQR 방식으로 변경 (라즈베리파이와 동일)
+                q1, q3 = np.percentile(scores, [25, 75])
+                iqr = q3 - q1
+                decision_boundary = q1 - 3 * iqr
+                
+                # 🔍 디버깅: 전체 평가에서도 경계값 확인
+                self.log(f"\n🔍 [디버깅] 전체 평가 Decision Boundary:")
+                self.log(f"  - 전체 Score 분포:")
+                self.log(f"    • 범위: [{np.min(scores):.2f}, {np.max(scores):.2f}]")
+                self.log(f"    • 평균: {np.mean(scores):.2f}")
+                self.log(f"    • 표준편차: {np.std(scores):.2f}")
+                self.log(f"  - Percentiles:")
+                for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
+                    self.log(f"    • P{p}: {np.percentile(scores, p):.2f}")
+                self.log(f"  - IQR 계산: Q1={q1:.2f}, Q3={q3:.2f}, IQR={iqr:.2f}")
+                self.log(f"  - Boundary = {q1:.2f} - 3*{iqr:.2f} = {decision_boundary:.2f}")
+                
+                self.log(f"결정 경계: {decision_boundary:.6f} (Q1={q1:.6f}, Q3={q3:.6f}, IQR={iqr:.6f})")
+                
+                # 이상치 비율 계산
+                predictions = model.predict(X_scaled)
                 anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
-                decision_boundary = float(np.percentile(scores, 5))
                 
                 self.log(f"✅ 학습 완료!")
                 self.log(f"  - 이상치 비율: {anomaly_ratio:.2f}%")
@@ -911,19 +985,19 @@ class OCSVMTrainerGUI:
                 normal_scores = scores[predictions == 1]
                 anomaly_scores = scores[predictions == -1]
                 
-                # 퍼센타일 기반 경계값 후보
-                percentiles = [0.1, 0.5, 1, 2, 3, 5, 10, 15, 20]
-                percentile_values = {}
-                
-                self.log("\n  정상 데이터 점수 분포:")
+                self.log(f"  정상 데이터 점수 분포:")
                 self.log(f"    - 개수: {len(normal_scores):,}개 ({len(normal_scores)/len(scores)*100:.1f}%)")
                 self.log(f"    - 평균±표준편차: {np.mean(normal_scores):.2f} ± {np.std(normal_scores):.2f}")
                 self.log(f"    - 최소/최대: {np.min(normal_scores):.2f} / {np.max(normal_scores):.2f}")
                 
-                self.log("\n  이상 데이터 점수 분포:")
+                self.log(f"  이상 데이터 점수 분포:")
                 self.log(f"    - 개수: {len(anomaly_scores):,}개 ({len(anomaly_scores)/len(scores)*100:.1f}%)")
                 self.log(f"    - 평균±표준편차: {np.mean(anomaly_scores):.2f} ± {np.std(anomaly_scores):.2f}")
                 self.log(f"    - 최소/최대: {np.min(anomaly_scores):.2f} / {np.max(anomaly_scores):.2f}")
+                
+                # 퍼센타일 기반 경계값 후보
+                percentiles = [0.1, 0.5, 1, 2, 3, 5, 10, 15, 20]
+                percentile_values = {}
                 
                 self.log("\n  전체 점수 퍼센타일:")
                 for p in percentiles:
@@ -1068,6 +1142,12 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
+                    'boundary_method': 'IQR',
+                    'boundary_stats': {
+                        'q1': float(q1),
+                        'q3': float(q3),
+                        'iqr': float(iqr)
+                    },
                     'anomaly_ratio': float(anomaly_ratio),
                     'score_statistics': {
                         'mean': float(np.mean(scores)),
@@ -1129,6 +1209,27 @@ class OCSVMTrainerGUI:
             
             joblib.dump(model, model_path)
             scaler.save(scaler_path)
+            
+            # 🔍 디버깅: 저장된 파일 검증
+            self.log(f"\n🔍 [디버깅] 저장된 파일 검증:")
+            
+            # 모델 재로드 테스트
+            test_model = joblib.load(model_path)
+            self.log(f"  - 모델 재로드 성공: {type(test_model).__name__}")
+            
+            # 스케일러 재로드 테스트
+            test_scaler = CustomRobustScaler()
+            test_scaler.load(scaler_path)
+            self.log(f"  - 스케일러 재로드 성공: {len(test_scaler.params)}개 특징")
+            
+            # 테스트 데이터로 검증
+            test_data = X_train[:10]  # 처음 10개 샘플
+            test_scaled = test_scaler.transform(test_data)
+            test_scores = test_model.decision_function(test_scaled)
+            self.log(f"  - 테스트 변환: 원본 [{test_data.min():.2f}, {test_data.max():.2f}] → "
+                    f"스케일 [{test_scaled.min():.2f}, {test_scaled.max():.2f}]")
+            self.log(f"  - 테스트 스코어: [{test_scores.min():.2f}, {test_scores.max():.2f}]")
+            self.log(f"  - 테스트 예측: {test_model.predict(test_scaled)}")
             
             with open(info_path, 'w') as f:
                 json.dump(model_info, f, indent=2)
@@ -1234,6 +1335,30 @@ class OCSVMTrainerGUI:
                 
                 # 예측
                 X_test_scaled = scaler.transform(test_data)
+                self.log(f"✅ 테스트 데이터 정규화 완료: {X_test_scaled.shape}")
+                
+                # 🔍 디버깅: 테스트 데이터 스케일 확인
+                self.log(f"\n🔍 [디버깅] 테스트 데이터 분석:")
+                self.log(f"  - 원본 데이터 범위: [{test_data.min():.2f}, {test_data.max():.2f}]")
+                self.log(f"  - 스케일 후 범위: [{X_test_scaled.min():.2f}, {X_test_scaled.max():.2f}]")
+                self.log(f"  - 스케일 후 평균: {X_test_scaled.mean():.4f}")
+                self.log(f"  - 스케일 후 표준편차: {X_test_scaled.std():.4f}")
+                
+                # 각 특징별 분포
+                for i, feature_name in enumerate(self.sensor_config[sensor]['features']):
+                    self.log(f"  [{feature_name}]")
+                    self.log(f"    원본: mean={test_data[:, i].mean():.2f}, std={test_data[:, i].std():.2f}")
+                    self.log(f"    스케일: mean={X_test_scaled[:, i].mean():.2f}, std={X_test_scaled[:, i].std():.2f}")
+                
+                # 모델 정보
+                self.log(f"\n🔍 [디버깅] 모델 정보:")
+                self.log(f"  - 모델 타입: {type(model).__name__}")
+                self.log(f"  - nu: {model.nu}")
+                self.log(f"  - gamma: {model.gamma}")
+                self.log(f"  - Support vectors: {model.support_vectors_.shape[0]}개")
+                
+                # 예측
+                self.log("모델 예측 수행 중...")
                 predictions = model.predict(X_test_scaled)
                 scores = model.decision_function(X_test_scaled)
                 
