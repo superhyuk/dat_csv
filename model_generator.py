@@ -48,7 +48,7 @@ class CustomRobustScaler:
     def load(self, filepath):
         loaded = joblib.load(filepath)
         self.params = loaded["params"]
-
+        
 class OCSVMTrainerGUI:
     def __init__(self, root):
         self.root = root
@@ -75,7 +75,7 @@ class OCSVMTrainerGUI:
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
                 "nu_range": [0.01, 0.15],
-                "gamma_range": [0.0005, 0.01]
+                "gamma_range": [0.0001, 0.005]
             }
         }
         
@@ -192,7 +192,7 @@ class OCSVMTrainerGUI:
         # 최적화 설정
         row += 1
         ttk.Label(config_frame, text="Optuna Trials:").grid(row=row, column=0, sticky=tk.W, padx=5)
-        self.trials_var = tk.IntVar(value=100)
+        self.trials_var = tk.IntVar(value=50)
         trials_spinbox = ttk.Spinbox(config_frame, from_=10, to=500, increment=10,
                                     textvariable=self.trials_var, width=10)
         trials_spinbox.grid(row=row, column=1, padx=5)
@@ -261,14 +261,56 @@ class OCSVMTrainerGUI:
         ttk.Label(train_button_frame, textvariable=self.progress_var).pack(side='left', padx=20)
     
     def create_test_tab(self, parent):
-        # 모델 선택 프레임
-        model_frame = ttk.LabelFrame(parent, text="테스트할 모델", padding="10")
+        # 모델 및 스케일러 선택 프레임
+        model_frame = ttk.LabelFrame(parent, text="모델 및 스케일러 선택", padding="10")
         model_frame.pack(fill='x', padx=5, pady=5)
         
-        ttk.Label(model_frame, text="모델 경로:").pack(side='left', padx=5)
-        self.model_path_var = tk.StringVar()
-        model_path_label = ttk.Label(model_frame, textvariable=self.model_path_var)
-        model_path_label.pack(side='left', padx=5)
+        # 센서 타입 선택
+        ttk.Label(model_frame, text="센서 타입:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.test_sensor_var = tk.StringVar(value="acc")
+        sensor_radio_frame = ttk.Frame(model_frame)
+        sensor_radio_frame.grid(row=0, column=1, columnspan=2, sticky=tk.W, padx=5)
+        
+        ttk.Radiobutton(sensor_radio_frame, text="가속도 센서", variable=self.test_sensor_var, 
+                        value="acc", command=self.update_test_settings).pack(side='left', padx=5)
+        ttk.Radiobutton(sensor_radio_frame, text="마이크 센서", variable=self.test_sensor_var, 
+                        value="mic", command=self.update_test_settings).pack(side='left', padx=5)
+        
+        # 모델 파일 선택
+        ttk.Label(model_frame, text="모델 파일:").grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.model_file_var = tk.StringVar()
+        ttk.Entry(model_frame, textvariable=self.model_file_var, width=50).grid(row=1, column=1, padx=5)
+        ttk.Button(model_frame, text="찾아보기", 
+                  command=self.browse_model_file).grid(row=1, column=2, padx=5)
+        
+        # 스케일러 파일 선택
+        ttk.Label(model_frame, text="스케일러 파일:").grid(row=2, column=0, sticky=tk.W, padx=5)
+        self.scaler_file_var = tk.StringVar()
+        ttk.Entry(model_frame, textvariable=self.scaler_file_var, width=50).grid(row=2, column=1, padx=5)
+        ttk.Button(model_frame, text="찾아보기", 
+                  command=self.browse_scaler_file).grid(row=2, column=2, padx=5)
+        
+        # 데이터베이스 설정 프레임
+        db_frame = ttk.LabelFrame(parent, text="데이터베이스 설정", padding="10")
+        db_frame.pack(fill='x', padx=5, pady=5)
+        
+        # 머신 선택
+        ttk.Label(db_frame, text="머신:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.test_machine_var = tk.StringVar(value="CURINGOVEN_M1")
+        ttk.Combobox(db_frame, textvariable=self.test_machine_var, 
+                    values=["CURINGOVEN_M1", "HOTCHAMBER_M2"], 
+                    width=20).grid(row=0, column=1, padx=5)
+        
+        # 샘플링 설정 표시
+        ttk.Label(db_frame, text="샘플링 설정:").grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.sampling_info_var = tk.StringVar(value="가속도: 1666Hz, 5초 윈도우")
+        ttk.Label(db_frame, textvariable=self.sampling_info_var).grid(row=1, column=1, sticky=tk.W, padx=5)
+        
+        # 특징 정보 표시
+        ttk.Label(db_frame, text="추출 특징:").grid(row=2, column=0, sticky=tk.W, padx=5)
+        self.features_info_var = tk.StringVar(value="x_peak, x_crest_factor, y_peak, y_crest_factor, z_peak, z_crest_factor")
+        features_label = ttk.Label(db_frame, textvariable=self.features_info_var, wraplength=400)
+        features_label.grid(row=2, column=1, sticky=tk.W, padx=5)
         
         # 테스트 기간 프레임
         test_period_frame = ttk.LabelFrame(parent, text="테스트 기간 설정", padding="10")
@@ -313,6 +355,47 @@ class OCSVMTrainerGUI:
         # 로그 텍스트 위젯 생성
         self.log_text = scrolledtext.ScrolledText(parent, height=30)
         self.log_text.pack(fill='both', expand=True, padx=5, pady=5)
+    
+    def update_test_settings(self):
+        """센서 타입에 따라 설정 정보 업데이트"""
+        sensor = self.test_sensor_var.get()
+        if sensor == "acc":
+            self.sampling_info_var.set("가속도: 1666Hz, 5초 윈도우")
+            self.features_info_var.set("x_peak, x_crest_factor, y_peak, y_crest_factor, z_peak, z_crest_factor")
+        else:
+            self.sampling_info_var.set("마이크: 8000Hz, 5초 윈도우")
+            self.features_info_var.set("mav, rms, peak, amp_iqr")
+    
+    def browse_model_file(self):
+        """모델 파일 찾아보기"""
+        from tkinter import filedialog
+        filename = filedialog.askopenfilename(
+            title="모델 파일 선택",
+            initialdir="./models",
+            filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")]
+        )
+        if filename:
+            self.model_file_var.set(filename)
+            
+            # 모델 정보 파일도 같이 찾기
+            info_path = filename.replace('_model.pkl', '_model_info.json')
+            if os.path.exists(info_path):
+                with open(info_path, 'r') as f:
+                    model_info = json.load(f)
+                    # 센서 타입 자동 설정
+                    self.test_sensor_var.set(model_info.get('sensor', 'acc'))
+                    self.update_test_settings()
+    
+    def browse_scaler_file(self):
+        """스케일러 파일 찾아보기"""
+        from tkinter import filedialog
+        filename = filedialog.askopenfilename(
+            title="스케일러 파일 선택",
+            initialdir="./models",
+            filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")]
+        )
+        if filename:
+            self.scaler_file_var.set(filename)
     
     def load_date_range(self):
         """DB에서 데이터 날짜 범위 확인"""
@@ -679,9 +762,8 @@ class OCSVMTrainerGUI:
             self.log(f"  - 스케일러: {scaler_path}")
             self.log(f"  - 정보: {info_path}")
             
-            # 테스트 탭에 모델 경로 설정
-            self.model_path_var.set(model_path)
-            self.current_model = (model, scaler, model_info)
+            # 현재 모델 정보 저장
+            self.current_model_info = model_info
             
             self.progress_var.set("학습 완료!")
             messagebox.showinfo("완료", "모델 학습이 완료되었습니다.")
@@ -710,24 +792,56 @@ class OCSVMTrainerGUI:
     def test_model(self):
         """모델 테스트"""
         try:
-            if not hasattr(self, 'current_model'):
-                messagebox.showerror("오류", "먼저 모델을 학습해주세요.")
+            # 모델 및 스케일러 파일 확인
+            model_path = self.model_file_var.get()
+            scaler_path = self.scaler_file_var.get()
+            
+            if not model_path or not scaler_path:
+                messagebox.showerror("오류", "모델과 스케일러 파일을 선택해주세요.")
                 return
             
-            model, scaler, model_info = self.current_model
-            machine_id = model_info['machine_id']
-            sensor = model_info['sensor']
+            if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+                messagebox.showerror("오류", "선택한 파일이 존재하지 않습니다.")
+                return
+            
+            # 모델 및 스케일러 로드
+            self.log("모델 및 스케일러 로드 중...")
+            model = joblib.load(model_path)
+            
+            scaler = CustomRobustScaler()
+            scaler.load(scaler_path)
+            
+            # 모델 정보 로드
+            info_path = model_path.replace('_model.pkl', '_model_info.json')
+            if os.path.exists(info_path):
+                with open(info_path, 'r') as f:
+                    model_info = json.load(f)
+            else:
+                # 기본 정보 사용
+                model_info = {
+                    'decision_boundary': -5.0,
+                    'sensor': self.test_sensor_var.get()
+                }
+            
+            # 테스트 설정
+            machine_id = self.test_machine_var.get()
+            sensor = self.test_sensor_var.get()
+            
+            # 센서별 데이터베이스 테이블 선택
+            table_name = f"normal_{sensor}_data"
             
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, f"모델 테스트 결과\n")
             self.result_text.insert(tk.END, f"{'='*60}\n")
             self.result_text.insert(tk.END, f"머신: {machine_id}, 센서: {sensor}\n")
-            self.result_text.insert(tk.END, f"결정 경계: {model_info['decision_boundary']:.6f}\n\n")
+            self.result_text.insert(tk.END, f"테이블: {table_name}\n")
+            self.result_text.insert(tk.END, f"샘플링: {self.sampling_info_var.get()}\n")
+            self.result_text.insert(tk.END, f"결정 경계: {model_info.get('decision_boundary', 'N/A')}\n\n")
             
             for test_date in self.test_periods:
                 self.result_text.insert(tk.END, f"\n[{test_date}]\n")
                 
-                # 테스트 데이터 추출
+                # 테스트 데이터 추출 (라즈베리파이와 동일한 방식)
                 test_data = self.get_training_data(
                     machine_id, sensor,
                     f"{test_date} 00:00:00",
@@ -756,6 +870,12 @@ class OCSVMTrainerGUI:
                 self.result_text.insert(tk.END, f"  - 점수 < 0: {np.sum(scores < 0)}개\n")
                 self.result_text.insert(tk.END, f"  - 점수 < -5: {np.sum(scores < -5)}개\n")
                 self.result_text.insert(tk.END, f"  - 점수 < -10: {np.sum(scores < -10)}개\n")
+                
+                # 결정 경계 기준 이상 탐지
+                if 'decision_boundary' in model_info:
+                    boundary = model_info['decision_boundary']
+                    below_boundary = np.sum(scores < boundary)
+                    self.result_text.insert(tk.END, f"  - 점수 < {boundary:.3f} (결정경계): {below_boundary}개\n")
                 
             self.result_text.insert(tk.END, f"\n{'='*60}\n")
             self.result_text.insert(tk.END, "테스트 완료\n")
