@@ -14,8 +14,10 @@ import threading
 from sklearn.svm import OneClassSVM
 import optuna
 from optuna import create_study
+from tkcalendar import DateEntry
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.dates as mdates
 
 # 라즈베리파이의 CustomRobustScaler 구현
 class CustomRobustScaler:
@@ -215,11 +217,15 @@ class OCSVMTrainerGUI:
         input_frame.pack(fill='x')
         
         ttk.Label(input_frame, text="시작일:").pack(side='left', padx=5)
-        self.train_start_date = ttk.Entry(input_frame, width=12)
+        self.train_start_date = DateEntry(input_frame, width=12, background='darkblue',
+                                         foreground='white', borderwidth=2,
+                                         date_pattern='yyyy-mm-dd')
         self.train_start_date.pack(side='left', padx=5)
         
         ttk.Label(input_frame, text="종료일:").pack(side='left', padx=5)
-        self.train_end_date = ttk.Entry(input_frame, width=12)
+        self.train_end_date = DateEntry(input_frame, width=12, background='darkblue',
+                                       foreground='white', borderwidth=2,
+                                       date_pattern='yyyy-mm-dd')
         self.train_end_date.pack(side='left', padx=5)
         
         ttk.Button(input_frame, text="기간 추가", 
@@ -329,33 +335,39 @@ class OCSVMTrainerGUI:
         test_input_frame = ttk.Frame(test_period_frame)
         test_input_frame.pack(fill='x')
         
-        ttk.Label(test_input_frame, text="날짜:").pack(side='left', padx=5)
-        self.test_date = ttk.Entry(test_input_frame, width=12)
-        self.test_date.pack(side='left', padx=5)
+        ttk.Label(test_input_frame, text="시작일:").pack(side='left', padx=5)
+        self.test_start_date = DateEntry(test_input_frame, width=12, background='darkblue',
+                                        foreground='white', borderwidth=2,
+                                        date_pattern='yyyy-mm-dd')
+        self.test_start_date.pack(side='left', padx=5)
         
-        ttk.Button(test_input_frame, text="날짜 추가", 
-                  command=self.add_test_date).pack(side='left', padx=20)
+        ttk.Label(test_input_frame, text="종료일:").pack(side='left', padx=5)
+        self.test_end_date = DateEntry(test_input_frame, width=12, background='darkblue',
+                                      foreground='white', borderwidth=2,
+                                      date_pattern='yyyy-mm-dd')
+        self.test_end_date.pack(side='left', padx=5)
         
-        # 테스트 날짜 목록
-        self.test_listbox = tk.Listbox(test_period_frame, height=8)
-        self.test_listbox.pack(fill='both', expand=True, pady=10)
+        ttk.Label(test_input_frame, text="(최대 30일)").pack(side='left', padx=10)
         
-        # 버튼
-        test_button_frame = ttk.Frame(test_period_frame)
-        test_button_frame.pack(fill='x')
-        
-        ttk.Button(test_button_frame, text="선택 삭제", 
-                  command=self.remove_test_date).pack(side='left', padx=5)
-        ttk.Button(test_button_frame, text="모두 삭제", 
-                  command=self.clear_test_dates).pack(side='left', padx=5)
-        
-        # 테스트 시작 버튼
+        # 테스트 버튼
         ttk.Button(parent, text="테스트 시작", 
                   command=self.start_testing).pack(pady=10)
         
+        # 플롯 영역
+        plot_frame = ttk.LabelFrame(parent, text="시계열 플롯", padding="10")
+        plot_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # matplotlib Figure
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+        test_button_frame = ttk.Frame(test_period_frame)
+        test_button_frame.pack(fill='x')
+        
         # 결과 표시
         result_frame = ttk.LabelFrame(parent, text="테스트 결과", padding="10")
-        result_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        result_frame.pack(fill='x', padx=5, pady=5)
         
         self.result_text = scrolledtext.ScrolledText(result_frame, height=10)
         self.result_text.pack(fill='both', expand=True)
@@ -417,9 +429,10 @@ class OCSVMTrainerGUI:
             min_date, max_date = cur.fetchone()
             
             if min_date and max_date:
-                self.train_start_date.insert(0, min_date.strftime("%Y-%m-%d"))
-                self.train_end_date.insert(0, max_date.strftime("%Y-%m-%d"))
-                self.test_date.insert(0, max_date.strftime("%Y-%m-%d"))
+                self.train_start_date.set_date(min_date)
+                self.train_end_date.set_date(max_date)
+                self.test_start_date.set_date(max_date - timedelta(days=7))
+                self.test_end_date.set_date(max_date)
                 
                 self.log(f"데이터 범위: {min_date} ~ {max_date}")
         except Exception as e:
@@ -473,11 +486,10 @@ class OCSVMTrainerGUI:
     
     def add_training_period(self):
         try:
-            start = self.train_start_date.get()
-            end = self.train_end_date.get()
-            
-            start_date = datetime.strptime(start, "%Y-%m-%d")
-            end_date = datetime.strptime(end, "%Y-%m-%d")
+            start_date = self.train_start_date.get_date()
+            end_date = self.train_end_date.get_date()
+            start = start_date.strftime("%Y-%m-%d")
+            end = end_date.strftime("%Y-%m-%d")
             
             if start_date >= end_date:
                 messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
@@ -512,26 +524,7 @@ class OCSVMTrainerGUI:
         self.training_periods.clear()
         for item in self.train_tree.get_children():
             self.train_tree.delete(item)
-    
-    def add_test_date(self):
-        date = self.test_date.get()
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-            if date not in self.test_listbox.get(0, tk.END):
-                self.test_listbox.insert(tk.END, date)
-                self.test_periods.append(date)
-        except ValueError:
-            messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
-    
-    def remove_test_date(self):
-        selected = self.test_listbox.curselection()
-        for idx in reversed(selected):
-            self.test_listbox.delete(idx)
-            del self.test_periods[idx]
-    
-    def clear_test_dates(self):
-        self.test_listbox.delete(0, tk.END)
-        self.test_periods.clear()
+
     
     def extract_features_acc(self, x_data, y_data, z_data):
         """ACC 특징 추출 - 다운샘플링된 데이터용"""
@@ -1337,29 +1330,55 @@ class OCSVMTrainerGUI:
             machine_id = self.test_machine_var.get()
             sensor = self.test_sensor_var.get()
             
+            # 날짜 범위 확인
+            start_date = self.test_start_date.get_date()
+            end_date = self.test_end_date.get_date()
+            
+            # 최대 30일 제한
+            if (end_date - start_date).days > 30:
+                messagebox.showerror("오류", "테스트 기간은 최대 30일까지만 가능합니다.")
+                return
+            
+            if start_date >= end_date:
+                messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
+                return
+            
             # 센서별 데이터베이스 테이블 선택
             table_name = f"normal_{sensor}_data"
             
+            # 결과 텍스트 초기화
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, f"모델 테스트 결과\n")
             self.result_text.insert(tk.END, f"{'='*60}\n")
             self.result_text.insert(tk.END, f"머신: {machine_id}, 센서: {sensor}\n")
             self.result_text.insert(tk.END, f"테이블: {table_name}\n")
+            self.result_text.insert(tk.END, f"기간: {start_date} ~ {end_date}\n")
             self.result_text.insert(tk.END, f"샘플링: {self.sampling_info_var.get()}\n")
             self.result_text.insert(tk.END, f"결정 경계: {model_info.get('decision_boundary', 'N/A')}\n\n")
             
-            for test_date in self.test_periods:
-                self.result_text.insert(tk.END, f"\n[{test_date}]\n")
+            # 전체 기간 데이터 수집
+            self.log(f"테스트 데이터 추출 중: {start_date} ~ {end_date}")
+            
+            # 날짜별로 데이터 수집
+            all_timestamps = []
+            all_scores = []
+            
+            current_date = start_date
+            while current_date <= end_date:
+                date_str = current_date.strftime("%Y-%m-%d")
+                self.result_text.insert(tk.END, f"\n[{date_str}] 처리 중...")
+                self.root.update_idletasks()
                 
                 # 테스트 데이터 추출 (라즈베리파이와 동일한 방식)
                 test_data = self.get_training_data(
                     machine_id, sensor,
-                    f"{test_date} 00:00:00",
-                    f"{test_date} 23:59:59"
+                    f"{date_str} 00:00:00",
+                    f"{date_str} 23:59:59"
                 )
                 
                 if test_data is None or len(test_data) == 0:
-                    self.result_text.insert(tk.END, "  - 데이터 없음\n")
+                    self.result_text.insert(tk.END, " 데이터 없음\n")
+                    current_date += timedelta(days=1)
                     continue
                 
                 # 예측
@@ -1398,58 +1417,96 @@ class OCSVMTrainerGUI:
                 predictions = model.predict(X_test_scaled)
                 scores = model.decision_function(X_test_scaled)
                 
-                # 시간대별 분석을 위한 데이터 준비
-                self.log(f"\n{test_date} 시간대별 분석 중...")
+                # 5초 윈도우로 타임스탬프 생성
+                window_sec = self.sensor_config[sensor]['window_sec']
+                timestamps = [datetime.strptime(f"{date_str} 00:00:00", "%Y-%m-%d %H:%M:%S") + 
+                            timedelta(seconds=i*window_sec) for i in range(len(scores))]
                 
-                # 원본 데이터에 예측 결과 추가
-                hourly_stats = self.analyze_hourly_anomalies(
-                    machine_id, sensor, test_date, 
-                    predictions, scores
-                )
+                all_timestamps.extend(timestamps)
+                all_scores.extend(scores)
                 
                 # 결과 분석
                 anomaly_count = np.sum(predictions == -1)
                 anomaly_ratio = anomaly_count / len(predictions) * 100
                 
-                self.result_text.insert(tk.END, f"  - 샘플 수: {len(test_data)}\n")
-                self.result_text.insert(tk.END, f"  - 이상 탐지: {anomaly_count}개 ({anomaly_ratio:.1f}%)\n")
-                self.result_text.insert(tk.END, f"  - 점수: 평균={np.mean(scores):.3f}, ")
-                self.result_text.insert(tk.END, f"최소={np.min(scores):.3f}, 최대={np.max(scores):.3f}\n")
+                self.result_text.insert(tk.END, f" 완료 (이상: {anomaly_count}/{len(predictions)}, {anomaly_ratio:.1f}%)\n")
                 
-                # 점수 분포
-                self.result_text.insert(tk.END, f"  - 점수 < 0: {np.sum(scores < 0)}개\n")
-                self.result_text.insert(tk.END, f"  - 점수 < -5: {np.sum(scores < -5)}개\n")
-                self.result_text.insert(tk.END, f"  - 점수 < -10: {np.sum(scores < -10)}개\n")
+                current_date += timedelta(days=1)
+            
+            # 플롯 그리기
+            self.plot_test_results(all_timestamps, all_scores, sensor, model_info)
+            
+            # 전체 결과 요약
+            if all_scores:
+                all_scores = np.array(all_scores)
+                total_anomalies = np.sum(all_scores < model_info.get('decision_boundary', 0))
+                total_ratio = total_anomalies / len(all_scores) * 100
                 
-                # 결정 경계 기준 이상 탐지
-                if 'decision_boundary' in model_info:
-                    boundary = model_info['decision_boundary']
-                    below_boundary = np.sum(scores < boundary)
-                    self.result_text.insert(tk.END, f"  - 점수 < {boundary:.3f} (결정경계): {below_boundary}개\n")
-                
-                # 시간대별 이상 탐지 결과
-                if hourly_stats:
-                    self.result_text.insert(tk.END, "\n  시간대별 이상 탐지:\n")
-                    for hour, stats in hourly_stats.items():
-                        if stats['anomaly_count'] > 0:
-                            self.result_text.insert(
-                                tk.END, 
-                                f"    {hour:02d}시: {stats['anomaly_count']}개/"
-                                f"{stats['total_count']}개 ({stats['anomaly_ratio']:.1f}%), "
-                                f"점수: {stats['mean_score']:.2f}\n"
-                            )
-                    
-                    # 이상이 가장 많이 발생한 시간대
-                    peak_hour = max(hourly_stats.items(), 
-                                  key=lambda x: x[1]['anomaly_count'])[0]
-                    self.result_text.insert(tk.END, 
-                                          f"  - 이상 최다 발생 시간: {peak_hour}시\n")
-                
-            self.result_text.insert(tk.END, f"\n{'='*60}\n")
-            self.result_text.insert(tk.END, "테스트 완료\n")
+                self.result_text.insert(tk.END, f"\n{'='*60}\n")
+                self.result_text.insert(tk.END, f"전체 결과 요약\n")
+                self.result_text.insert(tk.END, f"총 윈도우 수: {len(all_scores):,}\n")
+                self.result_text.insert(tk.END, f"이상 탐지: {total_anomalies:,}개 ({total_ratio:.2f}%)\n")
+                self.result_text.insert(tk.END, f"점수 범위: [{np.min(all_scores):.2f}, {np.max(all_scores):.2f}]\n")
+                self.result_text.insert(tk.END, f"평균 점수: {np.mean(all_scores):.2f} ± {np.std(all_scores):.2f}\n")
             
         except Exception as e:
             messagebox.showerror("오류", f"테스트 중 오류 발생: {e}")
+            self.log(f"테스트 오류: {e}")
+    
+    def plot_test_results(self, timestamps, scores, sensor, model_info):
+        """테스트 결과를 시계열 플롯으로 표시"""
+        try:
+            # 기존 플롯 클리어
+            self.ax1.clear()
+            self.ax2.clear()
+            
+            # numpy 배열로 변환
+            scores = np.array(scores)
+            decision_boundary = model_info.get('decision_boundary', 0)
+            
+            # 1. Score 플롯
+            self.ax1.plot(timestamps, scores, 'b-', linewidth=0.5, alpha=0.7, label='Score')
+            self.ax1.axhline(y=decision_boundary, color='r', linestyle='--', linewidth=2, 
+                            label=f'Decision Boundary ({decision_boundary:.2f})')
+            self.ax1.axhline(y=0, color='k', linestyle='-', linewidth=1, alpha=0.3)
+            
+            # 이상 구간 표시
+            anomaly_mask = scores < decision_boundary
+            if np.any(anomaly_mask):
+                self.ax1.scatter(np.array(timestamps)[anomaly_mask], 
+                               scores[anomaly_mask], 
+                               color='red', s=10, alpha=0.5, label='Anomaly')
+            
+            self.ax1.set_ylabel(f'{sensor.upper()} Score', fontsize=12)
+            self.ax1.set_title(f'{self.test_machine_var.get()} - {sensor.upper()} 이상 탐지 결과', fontsize=14)
+            self.ax1.legend(loc='upper right')
+            self.ax1.grid(True, alpha=0.3)
+            
+            # 2. 이상 빈도 히스토그램 (시간별)
+            # 1시간 단위로 이상 개수 집계
+            hour_bins = pd.date_range(start=min(timestamps), end=max(timestamps), freq='H')
+            hour_counts = []
+            
+            for i in range(len(hour_bins)-1):
+                mask = (np.array(timestamps) >= hour_bins[i]) & (np.array(timestamps) < hour_bins[i+1])
+                hour_anomalies = np.sum(scores[mask] < decision_boundary) if np.any(mask) else 0
+                hour_counts.append(hour_anomalies)
+            
+            self.ax2.bar(hour_bins[:-1], hour_counts, width=1/24, alpha=0.7, color='red')
+            self.ax2.set_ylabel('시간당 이상 개수', fontsize=12)
+            self.ax2.set_xlabel('시간', fontsize=12)
+            self.ax2.grid(True, alpha=0.3)
+            
+            # X축 포맷팅
+            self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H시'))
+            self.ax2.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            plt.setp(self.ax2.xaxis.get_majorticklabels(), rotation=45)
+            
+            self.fig.tight_layout()
+            self.canvas.draw()
+            
+        except Exception as e:
+            self.log(f"플롯 생성 오류: {e}")
     
     def analyze_hourly_anomalies(self, machine_id, sensor, test_date, predictions, scores):
         """시간대별 이상 탐지 분석"""
@@ -1523,8 +1580,11 @@ class OCSVMTrainerGUI:
             return None
     
     def start_testing(self):
-        if not self.test_periods:
-            messagebox.showerror("오류", "테스트 날짜를 추가해주세요.")
+        start_date = self.test_start_date.get_date()
+        end_date = self.test_end_date.get_date()
+        
+        if start_date >= end_date:
+            messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
             return
         
         thread = threading.Thread(target=self.test_model)
