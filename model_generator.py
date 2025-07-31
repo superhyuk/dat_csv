@@ -956,15 +956,15 @@ class OCSVMTrainerGUI:
                 sample_scores = model.decision_function(X_scaled[sample_indices])
                 
                 # Score 범위 정규화
-                score_min = np.percentile(sample_scores, 5)   # 하위 5%
-                score_max = np.percentile(sample_scores, 95)  # 상위 95%
+                score_min = np.percentile(sample_scores, 10)   # 하위 10% (극단값 더 제외)
+                score_max = np.percentile(sample_scores, 90)   # 상위 90% (극단값 더 제외)
                 score_range = score_max - score_min
                 
                 # 정규화
                 normalized_scores = (sample_scores - score_min) / score_range
                 
                 # 결정 경계 설정 (정규화된 공간에서)
-                decision_boundary = np.percentile(normalized_scores, 1.5)  # 하위 1.5%
+                decision_boundary = np.percentile(normalized_scores, 2.5)  # 하위 2.5% (조금 올림)
                 
                 # 🔍 디버깅: boundary 계산 과정
                 self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
@@ -993,7 +993,7 @@ class OCSVMTrainerGUI:
                     'score_normalization': {
                         'offset': float(score_min),
                         'scale': float(score_range),
-                        'method': 'percentile_5_95'
+                        'method': 'percentile_10_90'
                     },
                     'normalized_stats': {
                         'mean': float(normalized_scores.mean()),
@@ -1049,15 +1049,15 @@ class OCSVMTrainerGUI:
                 self.log("\n결정 경계 계산 중...")
                 
                 # Score 범위 정규화
-                score_min = np.percentile(scores, 5)   # 하위 5%
-                score_max = np.percentile(scores, 95)  # 상위 95%
+                score_min = np.percentile(scores, 10)   # 하위 10% (극단값 더 제외)
+                score_max = np.percentile(scores, 90)   # 상위 90% (극단값 더 제외)
                 score_range = score_max - score_min
                 
                 # 정규화
                 normalized_scores = (scores - score_min) / score_range
                 
                 # 결정 경계 설정 (정규화된 공간에서)
-                decision_boundary = np.percentile(normalized_scores, 1.5)  # 하위 1.5%
+                decision_boundary = np.percentile(normalized_scores, 2.5)  # 하위 2.5% (조금 올림)
                 
                 # 정상 데이터 분포 확인
                 normal_scores = normalized_scores[normalized_scores > decision_boundary]
@@ -1268,7 +1268,7 @@ class OCSVMTrainerGUI:
                     'score_normalization': {
                         'offset': float(score_min),
                         'scale': float(score_range),
-                        'method': 'percentile_5_95'
+                        'method': 'percentile_10_90'
                     },
                     'normalized_stats': {
                         'mean': float(normalized_scores.mean()),

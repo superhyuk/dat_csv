@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # manual_s3_up.py
-
+#라즈베리파이에서 업로드 하기 위한 파일일
 import boto3
 import os
 from common_utils import load_aws_config, load_config
