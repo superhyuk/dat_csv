@@ -69,15 +69,15 @@ class OCSVMTrainerGUI:
                 "sampling_rate": 8000,
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
-                "nu_range": [0.01, 0.15],
-                "gamma_range": [0.001, 0.1]  # score를 더 낮추기 위해 범위 조정
+                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일하게 낮은 범위
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
-                "nu_range": [0.01, 0.15],
-                "gamma_range": [0.001, 0.1]  # score를 더 낮추기 위해 범위 조정
+                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일하게 낮은 범위
             }
         }
         
