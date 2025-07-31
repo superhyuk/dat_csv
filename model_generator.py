@@ -233,21 +233,59 @@ class OCSVMTrainerGUI:
         ttk.Button(input_frame, text="기간 추가", 
                   command=self.add_training_period).pack(side='left', padx=20)
         
+        # 시간 필터 프레임 추가
+        time_filter_frame = ttk.Frame(period_frame)
+        time_filter_frame.pack(fill='x', pady=10)
+        
+        # 시간 필터 체크박스
+        self.use_time_filter = tk.BooleanVar(value=False)
+        self.time_filter_check = ttk.Checkbutton(time_filter_frame, text="시간 필터 사용", 
+                                                 variable=self.use_time_filter,
+                                                 command=self.toggle_time_filter)
+        self.time_filter_check.pack(side='left', padx=5)
+        
+        # 시간 선택 위젯들
+        self.time_widgets_frame = ttk.Frame(time_filter_frame)
+        self.time_widgets_frame.pack(side='left', padx=20)
+        
+        ttk.Label(self.time_widgets_frame, text="시작 시간:").pack(side='left', padx=5)
+        self.start_hour = ttk.Spinbox(self.time_widgets_frame, from_=0, to=23, width=3, format="%02.0f")
+        self.start_hour.set("00")
+        self.start_hour.pack(side='left')
+        ttk.Label(self.time_widgets_frame, text=":").pack(side='left')
+        self.start_minute = ttk.Spinbox(self.time_widgets_frame, from_=0, to=59, width=3, format="%02.0f")
+        self.start_minute.set("00")
+        self.start_minute.pack(side='left')
+        
+        ttk.Label(self.time_widgets_frame, text="  종료 시간:").pack(side='left', padx=(20,5))
+        self.end_hour = ttk.Spinbox(self.time_widgets_frame, from_=0, to=23, width=3, format="%02.0f")
+        self.end_hour.set("23")
+        self.end_hour.pack(side='left')
+        ttk.Label(self.time_widgets_frame, text=":").pack(side='left')
+        self.end_minute = ttk.Spinbox(self.time_widgets_frame, from_=0, to=59, width=3, format="%02.0f")
+        self.end_minute.set("59")
+        self.end_minute.pack(side='left')
+        
+        # 기본적으로 시간 필터 비활성화
+        self.toggle_time_filter()
+        
         # 기간 목록
         list_frame = ttk.Frame(period_frame)
         list_frame.pack(fill='both', expand=True, pady=10)
         
         # 트리뷰
-        columns = ('시작일', '종료일', '일수')
+        columns = ('시작일', '종료일', '시간대', '일수')
         self.train_tree = ttk.Treeview(list_frame, columns=columns, height=8)
         self.train_tree.heading('#0', text='No')
         self.train_tree.heading('시작일', text='시작일')
         self.train_tree.heading('종료일', text='종료일')
+        self.train_tree.heading('시간대', text='시간대')
         self.train_tree.heading('일수', text='일수')
         
         self.train_tree.column('#0', width=50)
         self.train_tree.column('시작일', width=150)
         self.train_tree.column('종료일', width=150)
+        self.train_tree.column('시간대', width=100)
         self.train_tree.column('일수', width=80)
         
         self.train_tree.pack(side='left', fill='both', expand=True)
@@ -500,6 +538,16 @@ class OCSVMTrainerGUI:
         
         return np.array(sample_indices)
     
+    def toggle_time_filter(self):
+        """시간 필터 체크박스 상태에 따라 시간 선택 위젯 활성화/비활성화"""
+        if self.use_time_filter.get():
+            for widget in self.time_widgets_frame.winfo_children():
+                widget.configure(state='normal')
+        else:
+            for widget in self.time_widgets_frame.winfo_children():
+                if isinstance(widget, (ttk.Spinbox, ttk.Entry)):
+                    widget.configure(state='disabled')
+    
     def add_training_period(self):
         try:
             start_date = self.train_start_date.get_date()
@@ -507,19 +555,37 @@ class OCSVMTrainerGUI:
             start = start_date.strftime("%Y-%m-%d")
             end = end_date.strftime("%Y-%m-%d")
             
-            if start_date >= end_date:
+            if start_date > end_date:  # >= 에서 > 로 변경하여 같은 날 허용
                 messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
                 return
             
             days = (end_date - start_date).days + 1
             
+            # 시간 필터 정보 추가
+            if self.use_time_filter.get():
+                start_time = f"{self.start_hour.get()}:{self.start_minute.get()}"
+                end_time = f"{self.end_hour.get()}:{self.end_minute.get()}"
+                time_range = f"{start_time}~{end_time}"
+            else:
+                time_range = "전체"
+                start_time = "00:00"
+                end_time = "23:59"
+            
             # 트리에 추가
             item_id = self.train_tree.insert('', 'end', 
                                            text=str(len(self.training_periods) + 1),
-                                           values=(start, end, days))
+                                           values=(start, end, time_range, days))
             
-            self.training_periods.append((start, end))
-            self.log(f"학습 기간 추가: {start} ~ {end} ({days}일)")
+            # 기간 정보에 시간 필터 포함
+            period_info = {
+                'start_date': start,
+                'end_date': end,
+                'start_time': start_time,
+                'end_time': end_time,
+                'use_time_filter': self.use_time_filter.get()
+            }
+            self.training_periods.append(period_info)
+            self.log(f"학습 기간 추가: {start} ~ {end} ({time_range}) - {days}일")
             
         except ValueError:
             messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
@@ -593,7 +659,7 @@ class OCSVMTrainerGUI:
             self.log(f"MIC 특징 추출 오류: {e}")
             raise
     
-    def get_training_data(self, machine_id, sensor, start_date, end_date):
+    def get_training_data(self, machine_id, sensor, start_date, end_date, start_time="00:00", end_time="23:59"):
         """DB에서 학습 데이터 추출 - 다운샘플링된 데이터 처리"""
         window_sec = self.sensor_config[sensor]['window_sec']
         
@@ -607,7 +673,8 @@ class OCSVMTrainerGUI:
             SELECT time, x, y, z
             FROM normal_acc_data
             WHERE machine_id = %s
-            AND time >= %s AND time <= %s
+            AND time >= %s::date + %s::time 
+            AND time <= %s::date + %s::time
             ORDER BY time
             """
         else:  # mic
@@ -615,23 +682,24 @@ class OCSVMTrainerGUI:
             SELECT time, mic_value
             FROM normal_mic_data
             WHERE machine_id = %s
-            AND time >= %s AND time <= %s
+            AND time >= %s::date + %s::time 
+            AND time <= %s::date + %s::time
             ORDER BY time
             """
         
-        self.log(f"데이터 추출 중: {machine_id}, {sensor}, {start_date} ~ {end_date}")
+        self.log(f"데이터 추출 중: {machine_id}, {sensor}, {start_date} {start_time} ~ {end_date} {end_time}")
         
         try:
-            start_time = datetime.now()
+            start_time_obj = datetime.now()
             df = pd.read_sql(query, self.conn, 
-                            params=(machine_id, start_date, end_date))
+                            params=(machine_id, start_date, start_time, end_date, end_time))
             
             if df.empty:
                 self.log(f"데이터가 없습니다!")
                 return None
             
             self.log(f"전체 데이터: {len(df)}개 샘플")
-            self.log(f"데이터 로드 시간: {(datetime.now() - start_time).total_seconds():.1f}초")
+            self.log(f"데이터 로드 시간: {(datetime.now() - start_time_obj).total_seconds():.1f}초")
             
             # Python에서 5초 윈도우로 분할
             features_list = []
@@ -662,7 +730,7 @@ class OCSVMTrainerGUI:
                         
                         # 진행 상황 로그 (1000개마다)
                         if window_count % 1000 == 0:
-                            elapsed = (datetime.now() - start_time).total_seconds()
+                            elapsed = (datetime.now() - start_time_obj).total_seconds()
                             rate = window_count / elapsed if elapsed > 0 else 0
                             self.log(f"  처리중: {window_count:,}개 윈도우 ({rate:.0f} windows/sec)")
                         
@@ -676,7 +744,7 @@ class OCSVMTrainerGUI:
                             self.log(f"  윈도우 처리 오류 발생: {e}")
                         continue
             
-            total_time = (datetime.now() - start_time).total_seconds()
+            total_time = (datetime.now() - start_time_obj).total_seconds()
             self.log(f"추출 완료: {len(features_list)}개 윈도우 (총 {total_time:.1f}초)")
             
             return np.array(features_list) if features_list else None
@@ -703,14 +771,27 @@ class OCSVMTrainerGUI:
             
             self.log(f"학습 기간: {len(self.training_periods)}개")
             
-            for idx, (start, end) in enumerate(self.training_periods):
-                self.log(f"\n[{idx+1}/{len(self.training_periods)}] 기간: {start} ~ {end}")
-                self.progress_var.set(f"데이터 추출 중: {start} ~ {end}")
-                features = self.get_training_data(machine_id, sensor, start, end)
+            for idx, period in enumerate(self.training_periods):
+                # 기간 정보 추출 (이전 버전 호환성 유지)
+                if isinstance(period, dict):
+                    start = period['start_date']
+                    end = period['end_date']
+                    start_time = period.get('start_time', '00:00')
+                    end_time = period.get('end_time', '23:59')
+                    time_str = f" ({start_time}~{end_time})" if period.get('use_time_filter', False) else ""
+                else:
+                    # 이전 버전 호환 (튜플 형식)
+                    start, end = period
+                    start_time, end_time = '00:00', '23:59'
+                    time_str = ""
+                
+                self.log(f"\n[{idx+1}/{len(self.training_periods)}] 기간: {start} ~ {end}{time_str}")
+                self.progress_var.set(f"데이터 추출 중: {start} ~ {end}{time_str}")
+                features = self.get_training_data(machine_id, sensor, start, end, start_time, end_time)
                 if features is not None and len(features) > 0:
                     all_features.append(features)
                     period_info.append({
-                        'period': f"{start} ~ {end}",
+                        'period': f"{start} ~ {end}{time_str}",
                         'start_idx': len(np.vstack(all_features[:-1])) if len(all_features) > 1 else 0,
                         'end_idx': len(np.vstack(all_features)),
                         'count': len(features)
@@ -964,7 +1045,7 @@ class OCSVMTrainerGUI:
                 normalized_scores = (sample_scores - score_min) / score_range
                 
                 # 결정 경계 설정 (정규화된 공간에서)
-                decision_boundary = np.percentile(normalized_scores, 10)  # 하위 10%
+                decision_boundary = np.percentile(normalized_scores, 0.5)  # 하위 0.5%만 이상으로
                 
                 # 🔍 디버깅: boundary 계산 과정
                 self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
@@ -1057,7 +1138,7 @@ class OCSVMTrainerGUI:
                 normalized_scores = (scores - score_min) / score_range
                 
                 # 결정 경계 설정 (정규화된 공간에서)
-                decision_boundary = np.percentile(normalized_scores, 10)  # 하위 10%
+                decision_boundary = np.percentile(normalized_scores, 0.5)  # 하위 0.5%만 이상으로
                 
                 # 정상 데이터 분포 확인
                 normal_scores = normalized_scores[normalized_scores > decision_boundary]
