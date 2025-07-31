@@ -954,18 +954,32 @@ class OCSVMTrainerGUI:
                 sample_size = min(10000, len(X_scaled))
                 sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
                 sample_scores = model.decision_function(X_scaled[sample_indices])
-                # IQR 방식 사용
-                q1, q3 = np.percentile(sample_scores, [25, 75])
-                iqr = q3 - q1
-                decision_boundary = q1 - 3 * iqr
+                
+                # Score 범위 정규화
+                score_min = np.percentile(sample_scores, 5)   # 하위 5%
+                score_max = np.percentile(sample_scores, 95)  # 상위 95%
+                score_range = score_max - score_min
+                
+                # 정규화
+                normalized_scores = (sample_scores - score_min) / score_range
+                
+                # 결정 경계 설정 (정규화된 공간에서)
+                decision_boundary = np.percentile(normalized_scores, 1.5)  # 하위 1.5%
                 
                 # 🔍 디버깅: boundary 계산 과정
                 self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
-                self.log(f"  - Score 분포: min={sample_scores.min():.2f}, max={sample_scores.max():.2f}")
-                self.log(f"  - Q1: {q1:.2f}")
-                self.log(f"  - Q3: {q3:.2f}")
-                self.log(f"  - IQR: {iqr:.2f}")
-                self.log(f"  - Boundary = Q1 - 3*IQR = {q1:.2f} - 3*{iqr:.2f} = {decision_boundary:.2f}")
+                self.log(f"  - 원본 Score 분포: [{sample_scores.min():.2f}, {sample_scores.max():.2f}]")
+                self.log(f"  - 정규화 범위: [{score_min:.2f}, {score_max:.2f}]")
+                self.log(f"  - 정규화 후 분포: [{normalized_scores.min():.3f}, {normalized_scores.max():.3f}]")
+                self.log(f"  - 정규화 후 평균: {normalized_scores.mean():.3f}")
+                self.log(f"  - 결정 경계 (정규화 공간): {decision_boundary:.3f}")
+                
+                # 정상 데이터 분포 확인
+                normal_scores = normalized_scores[normalized_scores > decision_boundary]
+                self.log(f"\n📊 정상 데이터 분포 (정규화 후):")
+                self.log(f"  - 범위: [{normal_scores.min():.3f}, {normal_scores.max():.3f}]")
+                self.log(f"  - 평균: {normal_scores.mean():.3f}")
+                self.log(f"  - 중앙값: {np.median(normal_scores):.3f}")
                 
                 model_info = {
                     'machine_id': machine_id,
@@ -975,11 +989,17 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
-                    'boundary_method': 'IQR',
-                    'boundary_stats': {
-                        'q1': float(q1),
-                        'q3': float(q3),
-                        'iqr': float(iqr)
+                    'boundary_method': 'normalized_percentile',
+                    'score_normalization': {
+                        'offset': float(score_min),
+                        'scale': float(score_range),
+                        'method': 'percentile_5_95'
+                    },
+                    'normalized_stats': {
+                        'mean': float(normalized_scores.mean()),
+                        'std': float(normalized_scores.std()),
+                        'min': float(normalized_scores.min()),
+                        'max': float(normalized_scores.max())
                     },
                     'evaluation_skipped': True,
                     'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1027,10 +1047,25 @@ class OCSVMTrainerGUI:
                 
                 # 결정 경계 계산
                 self.log("\n결정 경계 계산 중...")
-                # IQR 방식으로 변경 (라즈베리파이와 동일)
-                q1, q3 = np.percentile(scores, [25, 75])
-                iqr = q3 - q1
-                decision_boundary = q1 - 3 * iqr
+                
+                # Score 범위 정규화
+                score_min = np.percentile(scores, 5)   # 하위 5%
+                score_max = np.percentile(scores, 95)  # 상위 95%
+                score_range = score_max - score_min
+                
+                # 정규화
+                normalized_scores = (scores - score_min) / score_range
+                
+                # 결정 경계 설정 (정규화된 공간에서)
+                decision_boundary = np.percentile(normalized_scores, 1.5)  # 하위 1.5%
+                
+                # 정상 데이터 분포 확인
+                normal_scores = normalized_scores[normalized_scores > decision_boundary]
+                self.log(f"\n📊 정상 데이터 분포 (정규화 후):")
+                self.log(f"  - 범위: [{normal_scores.min():.3f}, {normal_scores.max():.3f}]")
+                self.log(f"  - 평균: {normal_scores.mean():.3f}")
+                self.log(f"  - 중앙값: {np.median(normal_scores):.3f}")
+                self.log(f"  - 결정 경계: {decision_boundary:.3f}")
                 
                 # 🔍 디버깅: 전체 평가에서도 경계값 확인
                 self.log(f"\n🔍 [디버깅] 전체 평가 Decision Boundary:")
@@ -1041,13 +1076,10 @@ class OCSVMTrainerGUI:
                 self.log(f"  - Percentiles:")
                 for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
                     self.log(f"    • P{p}: {np.percentile(scores, p):.2f}")
-                self.log(f"  - IQR 계산: Q1={q1:.2f}, Q3={q3:.2f}, IQR={iqr:.2f}")
-                self.log(f"  - Boundary = {q1:.2f} - 3*{iqr:.2f} = {decision_boundary:.2f}")
                 
-                self.log(f"결정 경계: {decision_boundary:.6f} (Q1={q1:.6f}, Q3={q3:.6f}, IQR={iqr:.6f})")
                 
                 # 이상치 비율 계산
-                predictions = model.predict(X_scaled)
+                predictions = (normalized_scores > decision_boundary).astype(int) * 2 - 1
                 anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
                 
                 self.log(f"✅ 학습 완료!")
@@ -1232,11 +1264,17 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
-                    'boundary_method': 'IQR',
-                    'boundary_stats': {
-                        'q1': float(q1),
-                        'q3': float(q3),
-                        'iqr': float(iqr)
+                    'boundary_method': 'normalized_percentile',
+                    'score_normalization': {
+                        'offset': float(score_min),
+                        'scale': float(score_range),
+                        'method': 'percentile_5_95'
+                    },
+                    'normalized_stats': {
+                        'mean': float(normalized_scores.mean()),
+                        'std': float(normalized_scores.std()),
+                        'min': float(normalized_scores.min()),
+                        'max': float(normalized_scores.max())
                     },
                     'anomaly_ratio': float(anomaly_ratio),
                     'score_statistics': {
