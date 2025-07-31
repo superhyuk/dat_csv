@@ -12,6 +12,7 @@ import json
 import os
 import threading
 from sklearn.svm import OneClassSVM
+from sklearn.model_selection import KFold
 import optuna
 from optuna import create_study
 from tkcalendar import DateEntry
@@ -69,15 +70,15 @@ class OCSVMTrainerGUI:
                 "sampling_rate": 8000,
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
-                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일하게 낮은 범위
+                "nu_range": [0.05, 0.3],  # 정상 데이터만 있으므로 더 넓게
+                "gamma_range": [0.01, 1.0]  # gamma 범위를 높여서 RBF 커널이 제대로 작동하도록
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
-                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일하게 낮은 범위
+                "nu_range": [0.05, 0.3],  # 정상 데이터만 있으므로 더 넓게
+                "gamma_range": [0.01, 1.0]  # gamma 범위를 높여서 RBF 커널이 제대로 작동하도록
             }
         }
         
@@ -197,7 +198,7 @@ class OCSVMTrainerGUI:
         # 최적화 설정
         row += 1
         ttk.Label(config_frame, text="Optuna Trials:").grid(row=row, column=0, sticky=tk.W, padx=5)
-        self.trials_var = tk.IntVar(value=50)
+        self.trials_var = tk.IntVar(value=100)  # 라즈베리파이처럼 더 많은 trials
         trials_spinbox = ttk.Spinbox(config_frame, from_=10, to=500, increment=10,
                                     textvariable=self.trials_var, width=10)
         trials_spinbox.grid(row=row, column=1, padx=5)
@@ -718,31 +719,13 @@ class OCSVMTrainerGUI:
             scaler_time = (datetime.now() - scaler_start).total_seconds()
             self.log(f"✅ 스케일러 학습 완료 ({scaler_time:.1f}초)")
             
-            # 개별 윈도우 스케일링 함수
-            def scale_windows_individually(X, scaler, progress_callback=None):
-                """각 윈도우를 개별적으로 스케일링"""
-                X_scaled = []
-                for i in range(len(X)):
-                    scaled = scaler.transform(X[i].reshape(1, -1))
-                    X_scaled.append(scaled[0])
-                    if progress_callback and i % 10000 == 0:
-                        progress_callback(i, len(X))
-                return np.array(X_scaled)
-            
-            # 전체 데이터 개별 스케일링
-            self.log("\n전체 데이터 개별 윈도우 스케일링 시작...")
+            # 전체 데이터 스케일링 (한 번에)
+            self.log("\n전체 데이터 스케일링 시작...")
             self.progress_var.set("데이터 스케일링 중...")
-            
-            def scaling_progress(current, total):
-                if current > 0:
-                    self.log(f"  스케일링 진행: {current:,}/{total:,} ({current/total*100:.1f}%)")
-                    self.progress_var.set(f"스케일링 중... {current/total*100:.1f}%")
-                    self.root.update_idletasks()
-            
             scaling_start = datetime.now()
-            X_scaled = scale_windows_individually(X_train, scaler, scaling_progress)
+            X_scaled = scaler.transform(X_train)  # 전체를 한 번에 변환
             scaling_time = (datetime.now() - scaling_start).total_seconds()
-            self.log(f"✅ 개별 윈도우 스케일링 완료 ({scaling_time:.1f}초, {len(X_scaled)/scaling_time:.0f} windows/sec)")
+            self.log(f"✅ 데이터 스케일링 완료 ({scaling_time:.1f}초)")
             
             # 🔍 디버깅: 원본 데이터와 스케일된 데이터 비교
             self.log("\n🔍 [디버깅] 데이터 스케일링 검증:")
@@ -804,9 +787,8 @@ class OCSVMTrainerGUI:
                 
                 sample_indices = np.array(sample_indices)
                 
-                # 샘플링된 윈도우들만 개별 스케일링
-                self.log(f"\n샘플링된 데이터 스케일링 중...")
-                X_sample = scale_windows_individually(X_train[sample_indices], scaler)
+                # 샘플링된 데이터 스케일링
+                X_sample = scaler.transform(X_train[sample_indices])
                 self.log(f"✅ 총 {len(X_sample)}개 샘플 추출 완료")
             else:
                 X_sample = X_scaled
@@ -815,6 +797,9 @@ class OCSVMTrainerGUI:
             trial_count = 0
             # study 변수를 클래스 변수로 만들어 objective 함수에서 접근 가능하게
             self.study = create_study(direction='maximize')
+            
+            # K-fold 설정 (라즈베리파이는 3을 사용)
+            n_splits = 3
             
             def objective(trial):
                 # 진행률 업데이트
@@ -825,15 +810,25 @@ class OCSVMTrainerGUI:
                 nu = trial.suggest_float('nu', nu_range[0], nu_range[1], log=True)
                 gamma = trial.suggest_float('gamma', gamma_range[0], gamma_range[1], log=True)
                 
-                model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma)
-                model.fit(X_sample)
+                # K-Fold 사용 (라즈베리파이와 동일)
+                if n_splits <= 1:
+                    model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma, cache_size=200)
+                    model.fit(X_sample)
+                    preds = model.predict(X_sample)
+                    return np.mean(preds == -1)  # 이상치 비율 최소화
                 
-                scores = model.decision_function(X_sample)
-                threshold = np.percentile(scores, 5)
-                predictions = (scores > threshold).astype(int)
-                score = np.mean(predictions)
+                # K-Fold가 있는 경우
+                from sklearn.model_selection import KFold
+                kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+                scores = []
+                for train_idx, test_idx in kf.split(X_sample):
+                    X_train, X_test = X_sample[train_idx], X_sample[test_idx]
+                    model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma, cache_size=200)
+                    model.fit(X_train)
+                    preds = model.predict(X_test)
+                    scores.append(np.mean(preds == -1))
                 
-                return score
+                return np.mean(scores)
             
             # Optuna 콜백 함수
             def optuna_callback(study, trial):
@@ -843,7 +838,8 @@ class OCSVMTrainerGUI:
                     self.log(f"  Trial {trial_count}: nu={trial.params['nu']:.4f}, "
                             f"gamma={trial.params['gamma']:.6f}, score={trial.value:.4f}")
             
-            # 최적화 실행
+            # 최적화 실행 (direction='minimize'로 변경)
+            self.study = create_study(direction='minimize')  # 이상치 비율 최소화
             self.study.optimize(objective, n_trials=n_trials, callbacks=[optuna_callback])
             
             optuna_time = (datetime.now() - optuna_start).total_seconds()
@@ -877,9 +873,34 @@ class OCSVMTrainerGUI:
                 self.log(f"  [{feature_name}] 범위: [{X_scaled[:, i].min():.4f}, {X_scaled[:, i].max():.4f}], "
                         f"평균: {X_scaled[:, i].mean():.4f}, 표준편차: {X_scaled[:, i].std():.4f}")
             
-            model = OneClassSVM(kernel='rbf', nu=best_nu, gamma=best_gamma)
+            model = OneClassSVM(kernel='rbf', nu=best_nu, gamma=best_gamma, cache_size=200)
             self.log(f"\n최종 모델 학습 시작 (nu={best_nu:.4f}, gamma={best_gamma:.6f})...")
-            model.fit(X_scaled)
+            
+            # 대규모 데이터 처리: 기간별 비례 샘플링
+            max_train_samples = 10000
+            if len(X_scaled) > max_train_samples:
+                self.log(f"\n📊 기간별 비례 샘플링: {len(X_scaled):,}개 → {max_train_samples:,}개")
+                
+                sampled_indices = []
+                for info in period_info:
+                    period_start = info['start_idx']
+                    period_end = info['end_idx']
+                    period_count = period_end - period_start
+                    
+                    # 각 기간에서 비례적으로 샘플
+                    period_sample_size = int(max_train_samples * (period_count / len(X_scaled)))
+                    if period_sample_size > 0:
+                        # 균등 간격으로 샘플링
+                        indices = np.linspace(period_start, period_end-1, period_sample_size, dtype=int)
+                        sampled_indices.extend(indices)
+                        self.log(f"  - {info['period']}: {period_sample_size}개 샘플")
+                
+                sampled_indices = np.array(sampled_indices)
+                X_train_final = X_scaled[sampled_indices]
+            else:
+                X_train_final = X_scaled
+                
+            model.fit(X_train_final)
             self.log("✅ 최종 모델 학습 완료")
             
             # 🔍 디버깅: 모델 정보
@@ -1408,13 +1429,8 @@ class OCSVMTrainerGUI:
                     continue
                 
                 # 예측
-                # 각 윈도우별로 개별 스케일링
-                self.log(f"테스트 데이터 개별 스케일링 중...")
-                X_test_scaled = []
-                for i in range(len(test_data)):
-                    scaled = scaler.transform(test_data[i].reshape(1, -1))
-                    X_test_scaled.append(scaled[0])
-                X_test_scaled = np.array(X_test_scaled)
+                # 테스트 데이터 스케일링
+                X_test_scaled = scaler.transform(test_data)
                 
                 self.log(f"✅ 테스트 데이터 정규화 완료: {X_test_scaled.shape}")
                 
