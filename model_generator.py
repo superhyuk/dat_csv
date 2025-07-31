@@ -71,15 +71,15 @@ class OCSVMTrainerGUI:
                 "sampling_rate": 8000,
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
-                "nu_range": [0.05, 0.3],  # 정상 데이터만 있으므로 더 넓게
-                "gamma_range": [0.01, 1.0]  # gamma 범위를 높여서 RBF 커널이 제대로 작동하도록
+                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
-                "nu_range": [0.05, 0.3],  # 정상 데이터만 있으므로 더 넓게
-                "gamma_range": [0.01, 1.0]  # gamma 범위를 높여서 RBF 커널이 제대로 작동하도록
+                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일
             }
         }
         
