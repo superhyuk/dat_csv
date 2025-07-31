@@ -16,6 +16,7 @@ from sklearn.model_selection import KFold
 import optuna
 from optuna import create_study
 from tkcalendar import DateEntry
+from tkcalendar import Calendar
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
@@ -337,15 +338,29 @@ class OCSVMTrainerGUI:
         test_input_frame.pack(fill='x')
         
         ttk.Label(test_input_frame, text="시작일:").pack(side='left', padx=5)
-        self.test_start_date = DateEntry(test_input_frame, width=12, background='darkblue',
-                                        foreground='white', borderwidth=2,
-                                        date_pattern='yyyy-mm-dd')
+        self.test_start_date = DateEntry(
+            test_input_frame, 
+            width=12, 
+            background='darkblue',
+            foreground='white', 
+            borderwidth=2,
+            date_pattern='yyyy-mm-dd',
+            showweeknumbers=False,
+            cursor="hand2"
+        )
         self.test_start_date.pack(side='left', padx=5)
         
         ttk.Label(test_input_frame, text="종료일:").pack(side='left', padx=5)
-        self.test_end_date = DateEntry(test_input_frame, width=12, background='darkblue',
-                                      foreground='white', borderwidth=2,
-                                      date_pattern='yyyy-mm-dd')
+        self.test_end_date = DateEntry(
+            test_input_frame, 
+            width=12, 
+            background='darkblue',
+            foreground='white', 
+            borderwidth=2,
+            date_pattern='yyyy-mm-dd',
+            showweeknumbers=False,
+            cursor="hand2"
+        )
         self.test_end_date.pack(side='left', padx=5)
         
         ttk.Label(test_input_frame, text="(최대 30일)").pack(side='left', padx=10)
@@ -901,6 +916,12 @@ class OCSVMTrainerGUI:
                 X_train_final = X_scaled
                 
             model.fit(X_train_final)
+            
+            # 학습 직후 score 확인 및 보정
+            train_scores = model.decision_function(X_train_final)
+            score_offset = np.mean(train_scores)  # 평균이 0이 되도록
+            self.log(f"Score offset 보정: {score_offset:.2f}")
+            
             self.log("✅ 최종 모델 학습 완료")
             
             # 🔍 디버깅: 모델 정보
@@ -1386,8 +1407,8 @@ class OCSVMTrainerGUI:
                 messagebox.showerror("오류", "테스트 기간은 최대 30일까지만 가능합니다.")
                 return
             
-            if start_date >= end_date:
-                messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
+            if start_date > end_date:
+                messagebox.showerror("오류", "시작일이 종료일보다 늦을 수 없습니다.")
                 return
             
             # 센서별 데이터베이스 테이블 선택
@@ -1625,8 +1646,8 @@ class OCSVMTrainerGUI:
         start_date = self.test_start_date.get_date()
         end_date = self.test_end_date.get_date()
         
-        if start_date >= end_date:
-            messagebox.showerror("오류", "시작일이 종료일보다 늦습니다.")
+        if start_date > end_date:
+            messagebox.showerror("오류", "시작일이 종료일보다 늦을 수 없습니다.")
             return
         
         thread = threading.Thread(target=self.test_model)
