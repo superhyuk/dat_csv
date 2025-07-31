@@ -72,14 +72,14 @@ class OCSVMTrainerGUI:
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
                 "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일
+                "gamma_range": [0.00001, 0.01]  # 중간 gamma 범위
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
                 "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일
+                "gamma_range": [0.00001, 0.01]  # 중간 gamma 범위
             }
         }
         
@@ -199,7 +199,7 @@ class OCSVMTrainerGUI:
         # 최적화 설정
         row += 1
         ttk.Label(config_frame, text="Optuna Trials:").grid(row=row, column=0, sticky=tk.W, padx=5)
-        self.trials_var = tk.IntVar(value=100)  # 라즈베리파이처럼 더 많은 trials
+        self.trials_var = tk.IntVar(value=200)  # 더 많은 trials로 최적 gamma 탐색
         trials_spinbox = ttk.Spinbox(config_frame, from_=10, to=500, increment=10,
                                     textvariable=self.trials_var, width=10)
         trials_spinbox.grid(row=row, column=1, padx=5)
@@ -997,11 +997,6 @@ class OCSVMTrainerGUI:
                 X_train_final = X_scaled
                 
             model.fit(X_train_final)
-            
-            # 학습 직후 score 확인 및 보정
-            train_scores = model.decision_function(X_train_final)
-            score_offset = np.mean(train_scores)  # 평균이 0이 되도록
-            self.log(f"Score offset 보정: {score_offset:.2f}")
             
             self.log("✅ 최종 모델 학습 완료")
             
