@@ -70,14 +70,14 @@ class OCSVMTrainerGUI:
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
                 "nu_range": [0.01, 0.15],
-                "gamma_range": [0.0001, 0.005]
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일한 범위
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
                 "nu_range": [0.01, 0.15],
-                "gamma_range": [0.0001, 0.005]
+                "gamma_range": [0.0001, 0.01]  # 라즈베리파이와 동일한 범위
             }
         }
         
@@ -854,11 +854,31 @@ class OCSVMTrainerGUI:
             
             # 최적 모델로 전체 데이터 학습
             self.progress_var.set("최종 모델 학습 중...")
-            self.log("\n최종 모델 학습 시작...")
+            self.log("\n🔍 최종 모델 학습 데이터 확인...")
             best_nu = self.study.best_params['nu']
             best_gamma = self.study.best_params['gamma']
             
+            # 학습 직전 데이터 확인
+            self.log(f"\n🔍 [중요] 최종 학습 데이터 검증:")
+            self.log(f"  - X_scaled shape: {X_scaled.shape}")
+            self.log(f"  - X_scaled dtype: {X_scaled.dtype}")
+            self.log(f"  - X_scaled 전체 범위: [{X_scaled.min():.4f}, {X_scaled.max():.4f}]")
+            self.log(f"  - X_scaled 전체 평균: {X_scaled.mean():.4f}")
+            self.log(f"  - X_scaled 전체 표준편차: {X_scaled.std():.4f}")
+            
+            # 첫 5개 샘플 상세 확인
+            self.log(f"\n🔍 첫 5개 샘플 상세 확인:")
+            for i in range(min(5, len(X_scaled))):
+                self.log(f"  샘플 {i}: {X_scaled[i]}")
+            
+            # 각 특징별 범위 확인
+            self.log(f"\n🔍 각 특징별 스케일된 범위:")
+            for i, feature_name in enumerate(self.sensor_config[sensor]['features']):
+                self.log(f"  [{feature_name}] 범위: [{X_scaled[:, i].min():.4f}, {X_scaled[:, i].max():.4f}], "
+                        f"평균: {X_scaled[:, i].mean():.4f}, 표준편차: {X_scaled[:, i].std():.4f}")
+            
             model = OneClassSVM(kernel='rbf', nu=best_nu, gamma=best_gamma)
+            self.log(f"\n최종 모델 학습 시작 (nu={best_nu:.4f}, gamma={best_gamma:.6f})...")
             model.fit(X_scaled)
             self.log("✅ 최종 모델 학습 완료")
             
@@ -869,6 +889,12 @@ class OCSVMTrainerGUI:
                     f"{model.dual_coef_.max():.4f}]")
             if hasattr(model, 'offset_'):
                 self.log(f"  - Offset: {model.offset_[0]:.4f}")
+                
+            # Offset 경고
+            if hasattr(model, 'offset_') and abs(model.offset_[0]) > 10:
+                self.log(f"\n⚠️ 경고: Offset이 비정상적으로 큽니다! ({model.offset_[0]:.4f})")
+                self.log(f"  → 스케일링이 제대로 안 되었을 가능성이 높습니다.")
+                self.log(f"  → 또는 gamma가 너무 낮을 수 있습니다.")
             
             # 모델 성능 평가 (선택적)
             skip_evaluation = self.skip_eval_var.get()  # GUI 체크박스 값 사용
@@ -1473,12 +1499,12 @@ class OCSVMTrainerGUI:
             # 이상 구간 표시
             anomaly_mask = scores < decision_boundary
             if np.any(anomaly_mask):
-                self.ax1.scatter(np.array(timestamps)[anomaly_mask], 
-                               scores[anomaly_mask], 
+                self.ax1.scatter(np.array(timestamps)[anomaly_mask],
+                               scores[anomaly_mask],
                                color='red', s=10, alpha=0.5, label='Anomaly')
             
             self.ax1.set_ylabel(f'{sensor.upper()} Score', fontsize=12)
-            self.ax1.set_title(f'{self.test_machine_var.get()} - {sensor.upper()} 이상 탐지 결과', fontsize=14)
+            self.ax1.set_title(f'{self.test_machine_var.get()} - {sensor.upper()} Anomaly Detection Results', fontsize=14)
             self.ax1.legend(loc='upper right')
             self.ax1.grid(True, alpha=0.3)
             
@@ -1493,12 +1519,12 @@ class OCSVMTrainerGUI:
                 hour_counts.append(hour_anomalies)
             
             self.ax2.bar(hour_bins[:-1], hour_counts, width=1/24, alpha=0.7, color='red')
-            self.ax2.set_ylabel('시간당 이상 개수', fontsize=12)
-            self.ax2.set_xlabel('시간', fontsize=12)
+            self.ax2.set_ylabel('Anomalies per Hour', fontsize=12)
+            self.ax2.set_xlabel('Time', fontsize=12)
             self.ax2.grid(True, alpha=0.3)
             
             # X축 포맷팅
-            self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H시'))
+            self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %Hh'))
             self.ax2.xaxis.set_major_locator(mdates.HourLocator(interval=6))
             plt.setp(self.ax2.xaxis.get_majorticklabels(), rotation=45)
             
