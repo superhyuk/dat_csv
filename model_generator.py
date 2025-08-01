@@ -11,7 +11,7 @@ import joblib
 import json
 import os
 import threading
-from sklearn.svm import OneClassSVM
+from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import KFold
 import optuna
 from optuna import create_study
@@ -71,15 +71,20 @@ class OCSVMTrainerGUI:
                 "sampling_rate": 8000,
                 "window_sec": 5,
                 "features": ["mav", "rms", "peak", "amp_iqr"],
-                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.00001, 0.01]  # 중간 gamma 범위
+                # Isolation Forest 파라미터
+                "n_estimators_range": [100, 300],
+                "contamination_range": [0.001, 0.05],
+                "max_samples_range": ['auto', 0.5, 1.0],
+                "max_features_range": [0.8, 1.0]
             },
             "acc": {
                 "sampling_rate": 1666,
                 "window_sec": 5,
                 "features": ["x_peak", "x_crest_factor", "y_peak", "y_crest_factor", "z_peak", "z_crest_factor"],
-                "nu_range": [0.01, 0.15],  # 라즈베리파이와 동일
-                "gamma_range": [0.00001, 0.01]  # 중간 gamma 범위
+                "n_estimators_range": [100, 300],
+                "contamination_range": [0.001, 0.05],
+                "max_samples_range": ['auto', 0.5, 1.0],
+                "max_features_range": [0.8, 1.0]
             }
         }
         
@@ -845,14 +850,52 @@ class OCSVMTrainerGUI:
             self.log(f"  - 95% 범위: [{np.percentile(X_scaled, 2.5):.4f}, "
                     f"{np.percentile(X_scaled, 97.5):.4f}]")
             
-            # OCSVM 최적화
+            # 점수 변환 함수 정의
+            def transform_scores(scores):
+                """Isolation Forest 점수를 -17 ~ 1 범위로 변환"""
+                # 원본 점수 범위 파악
+                min_score = np.min(scores)
+                max_score = np.max(scores)
+                
+                # 백분위수 기반 변환
+                p1 = np.percentile(scores, 1)
+                p99 = np.percentile(scores, 99)
+                
+                # 선형 변환: p1 → -17, p99 → 1
+                # y = ax + b 형태로 변환
+                a = 18.0 / (p99 - p1)  # (1 - (-17)) / (p99 - p1)
+                b = 1 - a * p99
+                
+                transformed = a * scores + b
+                
+                # 극단값 클리핑
+                transformed = np.clip(transformed, -17, 1)
+                
+                return transformed, {
+                    'original_min': float(min_score),
+                    'original_max': float(max_score),
+                    'p1': float(p1),
+                    'p99': float(p99),
+                    'transform_a': float(a),
+                    'transform_b': float(b)
+                }
+            
+            # 역변환 함수 (테스트용)
+            def inverse_transform_scores(transformed_scores, transform_info):
+                """변환된 점수를 원본으로 역변환"""
+                scores = (transformed_scores - transform_info['transform_b']) / transform_info['transform_a']
+                return scores
+            
+            # Isolation Forest 최적화
             self.log(f"\n하이퍼파라미터 최적화 시작 (Optuna {n_trials} trials)")
             optuna_start = datetime.now()
             self.progress_var.set(f"하이퍼파라미터 최적화 중... (0/{n_trials})")
             
             opt_config = self.sensor_config[sensor]
-            nu_range = opt_config['nu_range']
-            gamma_range = opt_config['gamma_range']
+            n_estimators_range = opt_config['n_estimators_range']
+            contamination_range = opt_config['contamination_range']
+            max_samples_range = opt_config['max_samples_range']
+            max_features_range = opt_config['max_features_range']
             
             # 시간적 분포를 고려한 계층적 샘플링
             target_sample_size = min(20000, int(len(X_scaled) * 0.1))  # 최대 20,000개
@@ -903,15 +946,26 @@ class OCSVMTrainerGUI:
                 self.progress_var.set(f"하이퍼파라미터 최적화 중... ({current_trial}/{n_trials})")
                 self.root.update_idletasks()
                 
-                nu = trial.suggest_float('nu', nu_range[0], nu_range[1], log=True)
-                gamma = trial.suggest_float('gamma', gamma_range[0], gamma_range[1], log=True)
+                # Isolation Forest 하이퍼파라미터
+                n_estimators = trial.suggest_int('n_estimators', n_estimators_range[0], n_estimators_range[1])
+                contamination = trial.suggest_float('contamination', contamination_range[0], contamination_range[1], log=True)
+                
+                # max_samples 처리
+                if max_samples_range[0] == 'auto':
+                    max_samples = trial.suggest_categorical('max_samples', ['auto'] + list(max_samples_range[1:]))
+                else:
+                    max_samples = trial.suggest_float('max_samples', max_samples_range[0], max_samples_range[-1])
+                
+                max_features = trial.suggest_float('max_features', max_features_range[0], max_features_range[1])
                 
                 # K-Fold 사용 (라즈베리파이와 동일)
                 if n_splits <= 1:
-                    model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma, cache_size=200)
+                    model = IsolationForest(n_estimators=n_estimators, contamination=contamination,
+                                          max_samples=max_samples, max_features=max_features,
+                                          random_state=42, n_jobs=-1)
                     model.fit(X_sample)
                     preds = model.predict(X_sample)
-                    return np.mean(preds == -1)  # 이상치 비율 최소화
+                    return np.mean(preds == -1)  # 이상치 비율
                 
                 # K-Fold가 있는 경우
                 from sklearn.model_selection import KFold
@@ -919,7 +973,9 @@ class OCSVMTrainerGUI:
                 scores = []
                 for train_idx, test_idx in kf.split(X_sample):
                     X_train, X_test = X_sample[train_idx], X_sample[test_idx]
-                    model = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma, cache_size=200)
+                    model = IsolationForest(n_estimators=n_estimators, contamination=contamination,
+                                          max_samples=max_samples, max_features=max_features,
+                                          random_state=42, n_jobs=-1)
                     model.fit(X_train)
                     preds = model.predict(X_test)
                     scores.append(np.mean(preds == -1))
@@ -931,8 +987,13 @@ class OCSVMTrainerGUI:
                 nonlocal trial_count
                 trial_count += 1
                 if trial_count % 10 == 0 or trial_count <= 5:
-                    self.log(f"  Trial {trial_count}: nu={trial.params['nu']:.4f}, "
-                            f"gamma={trial.params['gamma']:.6f}, score={trial.value:.4f}")
+                    max_samples_str = trial.params.get('max_samples', 'N/A')
+                    if isinstance(max_samples_str, float):
+                        max_samples_str = f"{max_samples_str:.2f}"
+                    
+                    self.log(f"  Trial {trial_count}: n_estimators={trial.params['n_estimators']}, "
+                            f"contamination={trial.params['contamination']:.4f}, "
+                            f"max_samples={max_samples_str}, score={trial.value:.4f}")
             
             # 최적화 실행 (direction='minimize'로 변경)
             self.study = create_study(direction='minimize')  # 이상치 비율 최소화
@@ -940,15 +1001,22 @@ class OCSVMTrainerGUI:
             
             optuna_time = (datetime.now() - optuna_start).total_seconds()
             self.log(f"\n✅ 최적화 완료 ({optuna_time:.1f}초)")
-            self.log(f"최적 파라미터: nu={self.study.best_params['nu']:.4f}, "
-                    f"gamma={self.study.best_params['gamma']:.6f}")
+            
+            best_params_str = f"n_estimators={self.study.best_params['n_estimators']}, "
+            best_params_str += f"contamination={self.study.best_params['contamination']:.4f}, "
+            best_params_str += f"max_samples={self.study.best_params.get('max_samples', 'auto')}, "
+            best_params_str += f"max_features={self.study.best_params['max_features']:.2f}"
+            
+            self.log(f"최적 파라미터: {best_params_str}")
             self.log(f"최적 점수: {self.study.best_value:.4f}")
             
             # 최적 모델로 전체 데이터 학습
             self.progress_var.set("최종 모델 학습 중...")
             self.log("\n🔍 최종 모델 학습 데이터 확인...")
-            best_nu = self.study.best_params['nu']
-            best_gamma = self.study.best_params['gamma']
+            best_n_estimators = self.study.best_params['n_estimators']
+            best_contamination = self.study.best_params['contamination']
+            best_max_samples = self.study.best_params.get('max_samples', 'auto')
+            best_max_features = self.study.best_params['max_features']
             
             # 학습 직전 데이터 확인
             self.log(f"\n🔍 [중요] 최종 학습 데이터 검증:")
@@ -969,8 +1037,11 @@ class OCSVMTrainerGUI:
                 self.log(f"  [{feature_name}] 범위: [{X_scaled[:, i].min():.4f}, {X_scaled[:, i].max():.4f}], "
                         f"평균: {X_scaled[:, i].mean():.4f}, 표준편차: {X_scaled[:, i].std():.4f}")
             
-            model = OneClassSVM(kernel='rbf', nu=best_nu, gamma=best_gamma, cache_size=200)
-            self.log(f"\n최종 모델 학습 시작 (nu={best_nu:.4f}, gamma={best_gamma:.6f})...")
+            model = IsolationForest(n_estimators=best_n_estimators, contamination=best_contamination,
+                                  max_samples=best_max_samples, max_features=best_max_features,
+                                  random_state=42, n_jobs=-1)
+            
+            self.log(f"\n최종 모델 학습 시작 ({best_params_str})...")
             
             # 대규모 데이터 처리: 기간별 비례 샘플링
             max_train_samples = 10000
@@ -1000,19 +1071,12 @@ class OCSVMTrainerGUI:
             
             self.log("✅ 최종 모델 학습 완료")
             
-            # 🔍 디버깅: 모델 정보
-            self.log(f"\n🔍 [디버깅] 모델 정보:")
-            self.log(f"  - Support vectors: {model.support_vectors_.shape[0]}개")
-            self.log(f"  - Dual coefficients 범위: [{model.dual_coef_.min():.4f}, "
-                    f"{model.dual_coef_.max():.4f}]")
+            # 🔍 디버깅: Isolation Forest 모델 정보
+            self.log(f"\n🔍 [디버깅] Isolation Forest 모델 정보:")
+            self.log(f"  - 트리 개수: {len(model.estimators_)}개")
+            self.log(f"  - 샘플 크기: {model.max_samples_}")
             if hasattr(model, 'offset_'):
-                self.log(f"  - Offset: {model.offset_[0]:.4f}")
-                
-            # Offset 경고
-            if hasattr(model, 'offset_') and abs(model.offset_[0]) > 10:
-                self.log(f"\n⚠️ 경고: Offset이 비정상적으로 큽니다! ({model.offset_[0]:.4f})")
-                self.log(f"  → 스케일링이 제대로 안 되었을 가능성이 높습니다.")
-                self.log(f"  → 또는 gamma가 너무 낮을 수 있습니다.")
+                self.log(f"  - Offset: {model.offset_}")
             
             # 모델 성능 평가 (선택적)
             skip_evaluation = self.skip_eval_var.get()  # GUI 체크박스 값 사용
@@ -1020,30 +1084,41 @@ class OCSVMTrainerGUI:
             # 🔍 항상 작은 샘플로 score 분포 확인
             sample_size = min(1000, len(X_scaled))
             sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
-            debug_scores = model.decision_function(X_scaled[sample_indices])
-            self.log(f"\n🔍 [디버깅] 샘플 {sample_size}개의 score 분포:")
+            debug_scores = model.score_samples(X_scaled[sample_indices])
+            
+            # 점수 변환
+            debug_transformed, transform_info = transform_scores(debug_scores)
+            
+            self.log(f"\n🔍 [디버깅] 샘플 {sample_size}개의 score 분포 (원본):")
             self.log(f"  - 범위: [{debug_scores.min():.2f}, {debug_scores.max():.2f}]")
+            self.log(f"  - 변환 후: [{debug_transformed.min():.2f}, {debug_transformed.max():.2f}]")
             
             if skip_evaluation:
                 self.log("\n⚡ 성능 평가 단계 스킵 (빠른 학습 모드)")
+                self.log(f"전체 데이터({len(X_scaled):,}개)로 score 계산 중...")
+                
                 # 간단한 샘플링으로 대략적인 성능만 확인
                 sample_size = min(10000, len(X_scaled))
                 sample_indices = np.random.choice(len(X_scaled), sample_size, replace=False)
-                sample_scores = model.decision_function(X_scaled[sample_indices])
+                sample_scores = model.score_samples(X_scaled[sample_indices])
+                
+                # 점수 변환
+                sample_scores_transformed, transform_info = transform_scores(sample_scores)
                 
                 # IQR 기반 결정 경계 (라즈베리파이와 동일)
-                q1, q3 = np.percentile(sample_scores, [25, 75])
+                q1, q3 = np.percentile(sample_scores_transformed, [25, 75])
                 iqr = q3 - q1
                 decision_boundary = q1 - 3 * iqr
                 
                 # 🔍 디버깅: boundary 계산 과정
                 self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
-                self.log(f"  - 원본 Score 분포: [{sample_scores.min():.2f}, {sample_scores.max():.2f}]")
+                self.log(f"  - 원본 Score 분포: [{sample_scores.min():.4f}, {sample_scores.max():.4f}]")
+                self.log(f"  - 변환 Score 분포: [{sample_scores_transformed.min():.2f}, {sample_scores_transformed.max():.2f}]")
                 self.log(f"  - Q1: {q1:.2f}, Q3: {q3:.2f}, IQR: {iqr:.2f}")
                 self.log(f"  - 결정 경계: {decision_boundary:.3f}")
                 
                 # 정상 데이터 분포 확인
-                normal_scores = sample_scores[sample_scores > decision_boundary]
+                normal_scores = sample_scores_transformed[sample_scores_transformed > decision_boundary]
                 self.log(f"\n📊 정상 데이터 분포:")
                 self.log(f"  - 범위: [{normal_scores.min():.3f}, {normal_scores.max():.3f}]")
                 self.log(f"  - 평균: {normal_scores.mean():.3f}")
@@ -1052,12 +1127,14 @@ class OCSVMTrainerGUI:
                 model_info = {
                     'machine_id': machine_id,
                     'sensor': sensor,
+                    'model_type': 'IsolationForest',
                     'train_samples': len(X_train),
                     'training_periods': self.training_periods,
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
                     'boundary_method': 'iqr',
+                    'score_transform': transform_info,
                     'iqr_stats': {
                         'q1': float(q1),
                         'q3': float(q3),
@@ -1083,7 +1160,7 @@ class OCSVMTrainerGUI:
                     
                     # 배치 예측
                     batch_predictions = model.predict(batch)
-                    batch_scores = model.decision_function(batch)
+                    batch_scores = model.score_samples(batch)
                     
                     predictions.extend(batch_predictions)
                     scores.extend(batch_scores)
@@ -1107,72 +1184,79 @@ class OCSVMTrainerGUI:
                 eval_time = (datetime.now() - eval_start).total_seconds()
                 self.log(f"✅ 예측 완료 ({eval_time:.1f}초)")
                 
+                # 점수 변환
+                scores_transformed, transform_info = transform_scores(scores)
+                
                 # 결정 경계 계산 (IQR 방식)
                 self.log("\n결정 경계 계산 중...")
                 
                 # IQR 기반 결정 경계 (라즈베리파이와 동일)
-                q1, q3 = np.percentile(scores, [25, 75])
+                q1, q3 = np.percentile(scores_transformed, [25, 75])
                 iqr = q3 - q1
                 decision_boundary = q1 - 3 * iqr
                 
                 # 정상 데이터 분포 확인
-                normal_scores = scores[scores > decision_boundary]
+                normal_scores_transformed = scores_transformed[scores_transformed > decision_boundary]
                 self.log(f"\n📊 정상 데이터 분포:")
-                self.log(f"  - 범위: [{normal_scores.min():.3f}, {normal_scores.max():.3f}]")
-                self.log(f"  - 평균: {normal_scores.mean():.3f}")
-                self.log(f"  - 중앙값: {np.median(normal_scores):.3f}")
+                self.log(f"  - 범위: [{normal_scores_transformed.min():.3f}, {normal_scores_transformed.max():.3f}]")
+                self.log(f"  - 평균: {normal_scores_transformed.mean():.3f}")
+                self.log(f"  - 중앙값: {np.median(normal_scores_transformed):.3f}")
                 self.log(f"  - 결정 경계: {decision_boundary:.3f}")
                 self.log(f"  - Q1: {q1:.3f}, Q3: {q3:.3f}, IQR: {iqr:.3f}")
                 
                 # 🔍 디버깅: 전체 평가에서도 경계값 확인
                 self.log(f"\n🔍 [디버깅] 전체 평가 Decision Boundary:")
-                self.log(f"  - 전체 Score 분포:")
+                self.log(f"  - 전체 Score 분포 (원본):")
                 self.log(f"    • 범위: [{np.min(scores):.2f}, {np.max(scores):.2f}]")
                 self.log(f"    • 평균: {np.mean(scores):.2f}")
                 self.log(f"    • 표준편차: {np.std(scores):.2f}")
+                self.log(f"  - 전체 Score 분포 (변환):")
+                self.log(f"    • 범위: [{np.min(scores_transformed):.2f}, {np.max(scores_transformed):.2f}]")
+                self.log(f"    • 평균: {np.mean(scores_transformed):.2f}")
+                self.log(f"    • 표준편차: {np.std(scores_transformed):.2f}")
                 self.log(f"  - Percentiles:")
                 for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
-                    self.log(f"    • P{p}: {np.percentile(scores, p):.2f}")
+                    self.log(f"    • P{p}: {np.percentile(scores_transformed, p):.2f}")
                 
                 
                 # 이상치 비율 계산
-                predictions = (scores > decision_boundary).astype(int) * 2 - 1
+                predictions = (scores_transformed > decision_boundary).astype(int) * 2 - 1
                 anomaly_ratio = np.sum(predictions == -1) / len(predictions) * 100
                 
                 self.log(f"✅ 학습 완료!")
                 self.log(f"  - 이상치 비율: {anomaly_ratio:.2f}%")
                 self.log(f"  - 결정 경계: {decision_boundary:.4f}")
-                self.log(f"  - 점수 범위: [{np.min(scores):.4f}, {np.max(scores):.4f}]")
-                self.log(f"  - 점수 평균±표준편차: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+                self.log(f"  - 변환 점수 범위: [{np.min(scores_transformed):.4f}, {np.max(scores_transformed):.4f}]")
+                self.log(f"  - 변환 점수 평균±표준편차: {np.mean(scores_transformed):.4f} ± {np.std(scores_transformed):.4f}")
                 
                 # 기간별 성능 분석
                 self.log("\n📊 기간별 성능:")
                 for info in period_info:
                     start_idx = info['start_idx']
                     end_idx = info['end_idx']
-                    period_scores = scores[start_idx:end_idx]
+                    period_scores_transformed = scores_transformed[start_idx:end_idx]
                     period_predictions = predictions[start_idx:end_idx]
                     period_anomaly_ratio = np.sum(period_predictions == -1) / len(period_predictions) * 100
                     
                     self.log(f"  - {info['period']}: 이상 {period_anomaly_ratio:.1f}%, "
-                            f"점수 {np.mean(period_scores):.2f}±{np.std(period_scores):.2f}")
+                            f"점수 {np.mean(period_scores_transformed):.2f}±{np.std(period_scores_transformed):.2f}")
                 
                 # 2차 로직을 위한 상세 통계 분석
                 self.log("\n📊 2차 로직 경계값 설정을 위한 분석:")
                 
                 # 정상/이상 데이터 분리
-                normal_scores = scores[predictions == 1]
-                anomaly_scores = scores[predictions == -1]
+                normal_scores_transformed = scores_transformed[predictions == 1]
+                anomaly_scores_transformed = scores_transformed[predictions == -1]
                 
                 self.log(f"  정상 데이터 점수 분포:")
-                self.log(f"    - 개수: {len(normal_scores):,}개 ({len(normal_scores)/len(scores)*100:.1f}%)")
-                self.log(f"    - 평균±표준편차: {np.mean(normal_scores):.2f} ± {np.std(normal_scores):.2f}")
-                self.log(f"    - 최소/최대: {np.min(normal_scores):.2f} / {np.max(normal_scores):.2f}")
+                self.log(f"    - 개수: {len(normal_scores_transformed):,}개 ({len(normal_scores_transformed)/len(scores_transformed)*100:.1f}%)")
+                self.log(f"    - 평균±표준편차: {np.mean(normal_scores_transformed):.2f} ± {np.std(normal_scores_transformed):.2f}")
+                self.log(f"    - 최소/최대: {np.min(normal_scores_transformed):.2f} / {np.max(normal_scores_transformed):.2f}")
                 
                 self.log(f"  이상 데이터 점수 분포:")
-                self.log(f"    - 개수: {len(anomaly_scores):,}개 ({len(anomaly_scores)/len(scores)*100:.1f}%)")
-                self.log(f"    - 평균±표준편차: {np.mean(anomaly_scores):.2f} ± {np.std(anomaly_scores):.2f}")
-                self.log(f"    - 최소/최대: {np.min(anomaly_scores):.2f} / {np.max(anomaly_scores):.2f}")
+                self.log(f"    - 개수: {len(anomaly_scores_transformed):,}개 ({len(anomaly_scores_transformed)/len(scores_transformed)*100:.1f}%)")
+                self.log(f"    - 평균±표준편차: {np.mean(anomaly_scores_transformed):.2f} ± {np.std(anomaly_scores_transformed):.2f}")
+                self.log(f"    - 최소/최대: {np.min(anomaly_scores_transformed):.2f} / {np.max(anomaly_scores_transformed):.2f}")
                 
                 # 퍼센타일 기반 경계값 후보
                 percentiles = [0.1, 0.5, 1, 2, 3, 5, 10, 15, 20]
@@ -1180,27 +1264,28 @@ class OCSVMTrainerGUI:
                 
                 self.log("\n  전체 점수 퍼센타일:")
                 for p in percentiles:
-                    val = np.percentile(scores, p)
+                    val = np.percentile(scores_transformed, p)
                     percentile_values[f"p{p}"] = float(val)
                     self.log(f"    - {p:5.1f}%: {val:8.2f}")
                 
                 # 점수 구간별 분포
                 self.log("\n  점수 구간별 분포:")
                 score_ranges = [
-                    (-np.inf, -100, "극심한 이상"),
-                    (-100, -50, "심각한 이상"),
-                    (-50, -20, "중간 이상"),
-                    (-20, -10, "경미한 이상"),
-                    (-10, 0, "의심 구간"),
-                    (0, 100, "정상 범위"),
-                    (100, np.inf, "매우 정상")
+                    (-np.inf, -17, "극심한 이상"),
+                    (-17, -15, "심각한 이상"),
+                    (-15, -10, "중간 이상"),
+                    (-10, -5, "경미한 이상"),
+                    (-5, -2, "의심 구간"),
+                    (-2, 0, "경계 구간"),
+                    (0, 1, "정상 범위"),
+                    (1, np.inf, "매우 정상")
                 ]
                 
                 score_distribution = {}
                 self.log("    [전체 데이터]")
                 for min_score, max_score, label in score_ranges:
-                    count = np.sum((scores >= min_score) & (scores < max_score))
-                    ratio = count / len(scores) * 100
+                    count = np.sum((scores_transformed >= min_score) & (scores_transformed < max_score))
+                    ratio = count / len(scores_transformed) * 100
                     self.log(f"    - {label:12s} [{min_score:6.0f} ~ {max_score:6.0f}]: "
                             f"{count:6,}개 ({ratio:5.1f}%)")
                 
@@ -1208,8 +1293,8 @@ class OCSVMTrainerGUI:
                 self.log("\n    [정상으로 분류된 데이터]")
                 normal_distribution = {}
                 for min_score, max_score, label in score_ranges:
-                    count = np.sum((normal_scores >= min_score) & (normal_scores < max_score))
-                    ratio = count / len(normal_scores) * 100 if len(normal_scores) > 0 else 0
+                    count = np.sum((normal_scores_transformed >= min_score) & (normal_scores_transformed < max_score))
+                    ratio = count / len(normal_scores_transformed) * 100 if len(normal_scores_transformed) > 0 else 0
                     normal_distribution[label] = {
                         'count': int(count),
                         'ratio': float(ratio),
@@ -1224,8 +1309,8 @@ class OCSVMTrainerGUI:
                 self.log("\n    [이상으로 분류된 데이터]")
                 anomaly_distribution = {}
                 for min_score, max_score, label in score_ranges:
-                    count = np.sum((anomaly_scores >= min_score) & (anomaly_scores < max_score))
-                    ratio = count / len(anomaly_scores) * 100 if len(anomaly_scores) > 0 else 0
+                    count = np.sum((anomaly_scores_transformed >= min_score) & (anomaly_scores_transformed < max_score))
+                    ratio = count / len(anomaly_scores_transformed) * 100 if len(anomaly_scores_transformed) > 0 else 0
                     anomaly_distribution[label] = {
                         'count': int(count),
                         'ratio': float(ratio),
@@ -1238,23 +1323,23 @@ class OCSVMTrainerGUI:
                 
                 # 전체 통합 분포
                 for min_score, max_score, label in score_ranges:
-                    total_count = np.sum((scores >= min_score) & (scores < max_score))
-                    normal_count = np.sum((normal_scores >= min_score) & (normal_scores < max_score))
-                    anomaly_count = np.sum((anomaly_scores >= min_score) & (anomaly_scores < max_score))
+                    total_count = np.sum((scores_transformed >= min_score) & (scores_transformed < max_score))
+                    normal_count = np.sum((normal_scores_transformed >= min_score) & (normal_scores_transformed < max_score))
+                    anomaly_count = np.sum((anomaly_scores_transformed >= min_score) & (anomaly_scores_transformed < max_score))
                     
                     score_distribution[label] = {
                         'total': {
                             'count': int(total_count),
-                            'ratio': float(total_count / len(scores) * 100)
+                            'ratio': float(total_count / len(scores_transformed) * 100)
                         },
                         'normal': {
                             'count': int(normal_count),
-                            'ratio': float(normal_count / len(normal_scores) * 100) if len(normal_scores) > 0 else 0,
+                            'ratio': float(normal_count / len(normal_scores_transformed) * 100) if len(normal_scores_transformed) > 0 else 0,
                             'of_total': float(normal_count / total_count * 100) if total_count > 0 else 0
                         },
                         'anomaly': {
                             'count': int(anomaly_count),
-                            'ratio': float(anomaly_count / len(anomaly_scores) * 100) if len(anomaly_scores) > 0 else 0,
+                            'ratio': float(anomaly_count / len(anomaly_scores_transformed) * 100) if len(anomaly_scores_transformed) > 0 else 0,
                             'of_total': float(anomaly_count / total_count * 100) if total_count > 0 else 0
                         },
                         'range': [float(min_score) if min_score != -np.inf else None,
@@ -1265,63 +1350,65 @@ class OCSVMTrainerGUI:
                 self.log("\n  📊 정상/이상 교차 분석:")
                 
                 # 정상으로 분류되었지만 점수가 낮은 데이터
-                normal_but_low_score = np.sum(normal_scores < 0)
+                normal_but_low_score = np.sum(normal_scores_transformed < -2)
                 if normal_but_low_score > 0:
-                    self.log(f"    - 정상 분류지만 점수 < 0: {normal_but_low_score:,}개 "
-                            f"({normal_but_low_score/len(normal_scores)*100:.1f}%)")
+                    self.log(f"    - 정상 분류지만 점수 < -2: {normal_but_low_score:,}개 "
+                            f"({normal_but_low_score/len(normal_scores_transformed)*100:.1f}%)")
                     
                     # 상세 분포
-                    for threshold in [-10, -20, -50, -100]:
-                        count = np.sum(normal_scores < threshold)
+                    for threshold in [-5, -10, -15]:
+                        count = np.sum(normal_scores_transformed < threshold)
                         if count > 0:
                             self.log(f"      • 점수 < {threshold}: {count:,}개 "
-                                    f"({count/len(normal_scores)*100:.2f}%)")
+                                    f"({count/len(normal_scores_transformed)*100:.2f}%)")
                 
                 # 이상으로 분류되었지만 점수가 높은 데이터
-                if len(anomaly_scores) > 0:
-                    anomaly_but_high_score = np.sum(anomaly_scores > 0)
+                if len(anomaly_scores_transformed) > 0:
+                    anomaly_but_high_score = np.sum(anomaly_scores_transformed > 0)
                     if anomaly_but_high_score > 0:
                         self.log(f"    - 이상 분류지만 점수 > 0: {anomaly_but_high_score:,}개 "
-                                f"({anomaly_but_high_score/len(anomaly_scores)*100:.1f}%)")
+                                f"({anomaly_but_high_score/len(anomaly_scores_transformed)*100:.1f}%)")
                 
                 # 경계 근처 데이터 분석
-                boundary_range = 10  # 결정 경계 ±10
-                near_boundary = np.sum(np.abs(scores - decision_boundary) < boundary_range)
+                boundary_range = 2  # 결정 경계 ±2
+                near_boundary = np.sum(np.abs(scores_transformed - decision_boundary) < boundary_range)
                 self.log(f"    - 결정 경계({decision_boundary:.2f}) ±{boundary_range} 범위: "
-                        f"{near_boundary:,}개 ({near_boundary/len(scores)*100:.1f}%)")
+                        f"{near_boundary:,}개 ({near_boundary/len(scores_transformed)*100:.1f}%)")
                 
                 # 2차 로직 경계값 추천
                 self.log("\n  💡 2차 로직 경계값 추천:")
                 
                 # 방법 1: 정상 데이터의 하위 퍼센타일
-                normal_lower_bound = np.percentile(normal_scores, 1)  # 정상의 하위 1%
+                normal_lower_bound = np.percentile(normal_scores_transformed, 1)  # 정상의 하위 1%
                 self.log(f"    - 정상 데이터 하위 1%: {normal_lower_bound:.2f}")
                 
                 # 방법 2: 전체 데이터의 특정 퍼센타일
-                overall_p3 = np.percentile(scores, 3)
+                overall_p3 = np.percentile(scores_transformed, 3)
                 self.log(f"    - 전체 데이터 하위 3%: {overall_p3:.2f}")
                 
                 # 방법 3: 평균 - n*표준편차
-                mean_minus_2std = np.mean(scores) - 2 * np.std(scores)
-                mean_minus_3std = np.mean(scores) - 3 * np.std(scores)
+                mean_minus_2std = np.mean(scores_transformed) - 2 * np.std(scores_transformed)
+                mean_minus_3std = np.mean(scores_transformed) - 3 * np.std(scores_transformed)
                 self.log(f"    - 평균 - 2σ: {mean_minus_2std:.2f}")
                 self.log(f"    - 평균 - 3σ: {mean_minus_3std:.2f}")
                 
                 # 방법 4: 이상 데이터의 상위 경계
-                if len(anomaly_scores) > 0:
-                    anomaly_upper = np.percentile(anomaly_scores, 90)  # 이상의 상위 10%
+                if len(anomaly_scores_transformed) > 0:
+                    anomaly_upper = np.percentile(anomaly_scores_transformed, 90)  # 이상의 상위 10%
                     self.log(f"    - 이상 데이터 상위 10%: {anomaly_upper:.2f}")
                 
                 # 모델 정보
                 model_info = {
                     'machine_id': machine_id,
                     'sensor': sensor,
+                    'model_type': 'IsolationForest',
                     'train_samples': len(X_train),
                     'training_periods': self.training_periods,
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
                     'boundary_method': 'iqr',
+                    'score_transform': transform_info,
                     'iqr_stats': {
                         'q1': float(q1),
                         'q3': float(q3),
@@ -1329,29 +1416,29 @@ class OCSVMTrainerGUI:
                     },
                     'anomaly_ratio': float(anomaly_ratio),
                     'score_statistics': {
-                        'mean': float(np.mean(scores)),
-                        'std': float(np.std(scores)),
-                        'min': float(np.min(scores)),
-                        'max': float(np.max(scores))
+                        'mean': float(np.mean(scores_transformed)),
+                        'std': float(np.std(scores_transformed)),
+                        'min': float(np.min(scores_transformed)),
+                        'max': float(np.max(scores_transformed))
                     },
                     'normal_score_statistics': {
-                        'count': int(len(normal_scores)),
-                        'mean': float(np.mean(normal_scores)),
-                        'std': float(np.std(normal_scores)),
-                        'min': float(np.min(normal_scores)),
-                        'max': float(np.max(normal_scores)),
+                        'count': int(len(normal_scores_transformed)),
+                        'mean': float(np.mean(normal_scores_transformed)),
+                        'std': float(np.std(normal_scores_transformed)),
+                        'min': float(np.min(normal_scores_transformed)),
+                        'max': float(np.max(normal_scores_transformed)),
                         'percentiles': {
-                            'p1': float(np.percentile(normal_scores, 1)),
-                            'p5': float(np.percentile(normal_scores, 5)),
-                            'p10': float(np.percentile(normal_scores, 10))
+                            'p1': float(np.percentile(normal_scores_transformed, 1)),
+                            'p5': float(np.percentile(normal_scores_transformed, 5)),
+                            'p10': float(np.percentile(normal_scores_transformed, 10))
                         }
                     },
                     'anomaly_score_statistics': {
-                        'count': int(len(anomaly_scores)),
-                        'mean': float(np.mean(anomaly_scores)) if len(anomaly_scores) > 0 else None,
-                        'std': float(np.std(anomaly_scores)) if len(anomaly_scores) > 0 else None,
-                        'min': float(np.min(anomaly_scores)) if len(anomaly_scores) > 0 else None,
-                        'max': float(np.max(anomaly_scores)) if len(anomaly_scores) > 0 else None
+                        'count': int(len(anomaly_scores_transformed)),
+                        'mean': float(np.mean(anomaly_scores_transformed)) if len(anomaly_scores_transformed) > 0 else None,
+                        'std': float(np.std(anomaly_scores_transformed)) if len(anomaly_scores_transformed) > 0 else None,
+                        'min': float(np.min(anomaly_scores_transformed)) if len(anomaly_scores_transformed) > 0 else None,
+                        'max': float(np.max(anomaly_scores_transformed)) if len(anomaly_scores_transformed) > 0 else None
                     },
                     'score_percentiles': percentile_values,
                     'score_distribution': score_distribution,
@@ -1360,7 +1447,7 @@ class OCSVMTrainerGUI:
                         'overall_p3': float(overall_p3),
                         'mean_minus_2std': float(mean_minus_2std),
                         'mean_minus_3std': float(mean_minus_3std),
-                        'anomaly_p90': float(anomaly_upper) if len(anomaly_scores) > 0 else None
+                        'anomaly_p90': float(anomaly_upper) if len(anomaly_scores_transformed) > 0 else None
                     },
                     'evaluation_skipped': False,
                     'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1404,10 +1491,17 @@ class OCSVMTrainerGUI:
             # 테스트 데이터로 검증
             test_data = X_train[:10]  # 처음 10개 샘플
             test_scaled = test_scaler.transform(test_data)
-            test_scores = test_model.decision_function(test_scaled)
+            test_scores = test_model.score_samples(test_scaled)
+            
+            # 점수 변환 테스트
+            test_transform_info = model_info['score_transform']
+            test_transformed = test_transform_info['transform_a'] * test_scores + test_transform_info['transform_b']
+            test_transformed = np.clip(test_transformed, -17, 1)
+            
             self.log(f"  - 테스트 변환: 원본 [{test_data.min():.2f}, {test_data.max():.2f}] → "
                     f"스케일 [{test_scaled.min():.2f}, {test_scaled.max():.2f}]")
-            self.log(f"  - 테스트 스코어: [{test_scores.min():.2f}, {test_scores.max():.2f}]")
+            self.log(f"  - 테스트 스코어: 원본 [{test_scores.min():.4f}, {test_scores.max():.4f}] → "
+                    f"변환 [{test_transformed.min():.2f}, {test_transformed.max():.2f}]")
             self.log(f"  - 테스트 예측: {test_model.predict(test_scaled)}")
             
             with open(info_path, 'w') as f:
@@ -1480,7 +1574,8 @@ class OCSVMTrainerGUI:
                 # 기본 정보 사용
                 model_info = {
                     'decision_boundary': -5.0,
-                    'sensor': self.test_sensor_var.get()
+                    'sensor': self.test_sensor_var.get(),
+                    'score_transform': None
                 }
             
             # 테스트 설정
@@ -1560,14 +1655,26 @@ class OCSVMTrainerGUI:
                 # 모델 정보
                 self.log(f"\n🔍 [디버깅] 모델 정보:")
                 self.log(f"  - 모델 타입: {type(model).__name__}")
-                self.log(f"  - nu: {model.nu}")
-                self.log(f"  - gamma: {model.gamma}")
-                self.log(f"  - Support vectors: {model.support_vectors_.shape[0]}개")
                 
                 # 예측
                 self.log("모델 예측 수행 중...")
                 predictions = model.predict(X_test_scaled)
-                scores = model.decision_function(X_test_scaled)
+                scores = model.score_samples(X_test_scaled)
+                
+                # 점수 변환 (모델 정보에 변환 정보가 있는 경우)
+                if model_info.get('score_transform'):
+                    transform_info = model_info['score_transform']
+                    scores_transformed = transform_info['transform_a'] * scores + transform_info['transform_b']
+                    scores_transformed = np.clip(scores_transformed, -17, 1)
+                else:
+                    # 변환 정보가 없으면 간단한 선형 변환
+                    min_score = np.min(scores)
+                    max_score = np.max(scores)
+                    scores_transformed = -17 + (scores - min_score) * 18 / (max_score - min_score)
+                
+                self.log(f"✅ 예측 완료:")
+                self.log(f"  - 원본 점수 범위: [{scores.min():.4f}, {scores.max():.4f}]")
+                self.log(f"  - 변환 점수 범위: [{scores_transformed.min():.2f}, {scores_transformed.max():.2f}]")
                 
                 # 5초 윈도우로 타임스탬프 생성
                 window_sec = self.sensor_config[sensor]['window_sec']
@@ -1575,7 +1682,7 @@ class OCSVMTrainerGUI:
                             timedelta(seconds=i*window_sec) for i in range(len(scores))]
                 
                 all_timestamps.extend(timestamps)
-                all_scores.extend(scores)
+                all_scores.extend(scores_transformed)
                 
                 # 결과 분석
                 anomaly_count = np.sum(predictions == -1)
