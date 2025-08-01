@@ -1626,7 +1626,7 @@ class OCSVMTrainerGUI:
             self.plot_test_results(all_timestamps, all_scores, sensor, model_info)
             
             # 전체 결과 요약
-            if all_scores:
+            if len(all_scores) > 0:
                 all_scores = np.array(all_scores)
                 decision_boundary_value = float(model_info.get('decision_boundary', 0))
                 total_anomalies = np.sum(all_scores < decision_boundary_value)
@@ -1869,7 +1869,7 @@ class OCSVMTrainerGUI:
             # 시간대별 통계 계산
             hourly_stats = {}
             for hour in range(24):
-                if hourly_predictions[hour]:
+                if len(hourly_predictions[hour]) > 0:
                     anomaly_count = sum(p == -1 for p in hourly_predictions[hour])
                     total_count = len(hourly_predictions[hour])
                     
