@@ -406,7 +406,7 @@ class OCSVMTrainerGUI:
         )
         self.test_end_date.pack(side='left', padx=5)
         
-        ttk.Label(test_input_frame, text="(최대 30일)").pack(side='left', padx=10)
+        ttk.Label(test_input_frame, text="(최대 5일)").pack(side='left', padx=10)
         
         # 테스트 버튼
         ttk.Button(parent, text="테스트 시작", 
@@ -417,7 +417,7 @@ class OCSVMTrainerGUI:
         plot_frame.pack(fill='both', expand=True, padx=5, pady=5)
         
         # matplotlib Figure
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8))
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         
@@ -664,7 +664,7 @@ class OCSVMTrainerGUI:
             self.log(f"MIC 특징 추출 오류: {e}")
             raise
     
-    def get_training_data(self, machine_id, sensor, start_date, end_date, start_time="00:00", end_time="23:59"):
+    def get_training_data(self, machine_id, sensor, start_date, end_date, start_time="00:00", end_time="23:59", return_timestamps=False):
         """DB에서 학습 데이터 추출 - 다운샘플링된 데이터 처리"""
         window_sec = self.sensor_config[sensor]['window_sec']
         
@@ -708,12 +708,13 @@ class OCSVMTrainerGUI:
             
             # Python에서 5초 윈도우로 분할
             features_list = []
+            timestamps_list = []  # 윈도우 타임스탬프 저장
             
             # 시간을 datetime으로 변환
             df['time'] = pd.to_datetime(df['time'])
             
             # 5초 단위로 그룹화
-            df['window'] = df['time'].dt.floor(f'{window_sec}S')
+            df['window'] = df['time'].dt.floor(f'{window_sec}s')  # 'S' -> 's'로 변경
             
             # 윈도우별로 처리
             window_count = 0
@@ -732,6 +733,10 @@ class OCSVMTrainerGUI:
                         
                         features_list.append(features)
                         window_count += 1
+                        
+                        # 타임스탬프 저장 (윈도우의 시작 시간)
+                        if return_timestamps:
+                            timestamps_list.append(window)
                         
                         # 진행 상황 로그 (1000개마다)
                         if window_count % 1000 == 0:
@@ -752,7 +757,10 @@ class OCSVMTrainerGUI:
             total_time = (datetime.now() - start_time_obj).total_seconds()
             self.log(f"추출 완료: {len(features_list)}개 윈도우 (총 {total_time:.1f}초)")
             
-            return np.array(features_list) if features_list else None
+            if return_timestamps:
+                return np.array(features_list) if features_list else None, timestamps_list
+            else:
+                return np.array(features_list) if features_list else None
             
         except Exception as e:
             self.log(f"데이터 추출 오류: {e}")
@@ -850,41 +858,14 @@ class OCSVMTrainerGUI:
             self.log(f"  - 95% 범위: [{np.percentile(X_scaled, 2.5):.4f}, "
                     f"{np.percentile(X_scaled, 97.5):.4f}]")
             
-            # 점수 변환 함수 정의
-            def transform_scores(scores):
-                """Isolation Forest 점수를 -17 ~ 1 범위로 변환"""
-                # 원본 점수 범위 파악
-                min_score = np.min(scores)
-                max_score = np.max(scores)
-                
-                # 백분위수 기반 변환
-                p1 = np.percentile(scores, 1)
-                p99 = np.percentile(scores, 99)
-                
-                # 선형 변환: p1 → -17, p99 → 1
-                # y = ax + b 형태로 변환
-                a = 18.0 / (p99 - p1)  # (1 - (-17)) / (p99 - p1)
-                b = 1 - a * p99
-                
-                transformed = a * scores + b
-                
-                # 극단값 클리핑
-                transformed = np.clip(transformed, -17, 1)
-                
-                return transformed, {
-                    'original_min': float(min_score),
-                    'original_max': float(max_score),
-                    'p1': float(p1),
-                    'p99': float(p99),
-                    'transform_a': float(a),
-                    'transform_b': float(b)
-                }
-            
+
             # 역변환 함수 (테스트용)
             def inverse_transform_scores(transformed_scores, transform_info):
-                """변환된 점수를 원본으로 역변환"""
-                scores = (transformed_scores - transform_info['transform_b']) / transform_info['transform_a']
-                return scores
+                """변환된 점수를 원본으로 역변환 (exponential transform의 역변환은 복잡하므로 근사치 사용)"""
+                # 새로운 exponential transform의 정확한 역변환은 복잡하므로
+                # 근사적인 역변환을 제공 (주로 디버깅/테스트 목적)
+                median_score = transform_info.get('median_score', -0.5)
+                return transformed_scores * 0.1 + median_score  # 간단한 근사
             
             # Isolation Forest 최적화
             self.log(f"\n하이퍼파라미터 최적화 시작 (Optuna {n_trials} trials)")
@@ -1087,7 +1068,7 @@ class OCSVMTrainerGUI:
             debug_scores = model.score_samples(X_scaled[sample_indices])
             
             # 점수 변환
-            debug_transformed, transform_info = transform_scores(debug_scores)
+            debug_transformed, transform_info = self.transform_scores(debug_scores)
             
             self.log(f"\n🔍 [디버깅] 샘플 {sample_size}개의 score 분포 (원본):")
             self.log(f"  - 범위: [{debug_scores.min():.2f}, {debug_scores.max():.2f}]")
@@ -1103,18 +1084,15 @@ class OCSVMTrainerGUI:
                 sample_scores = model.score_samples(X_scaled[sample_indices])
                 
                 # 점수 변환
-                sample_scores_transformed, transform_info = transform_scores(sample_scores)
+                sample_scores_transformed, transform_info = self.transform_scores(sample_scores)
                 
-                # IQR 기반 결정 경계 (라즈베리파이와 동일)
-                q1, q3 = np.percentile(sample_scores_transformed, [25, 75])
-                iqr = q3 - q1
-                decision_boundary = q1 - 3 * iqr
+                # 결정 경계 설정: 정상 데이터의 하위 5%를 경계로
+                decision_boundary = np.percentile(sample_scores_transformed, 5)
                 
                 # 🔍 디버깅: boundary 계산 과정
                 self.log(f"\n🔍 [디버깅] Decision Boundary 계산:")
                 self.log(f"  - 원본 Score 분포: [{sample_scores.min():.4f}, {sample_scores.max():.4f}]")
                 self.log(f"  - 변환 Score 분포: [{sample_scores_transformed.min():.2f}, {sample_scores_transformed.max():.2f}]")
-                self.log(f"  - Q1: {q1:.2f}, Q3: {q3:.2f}, IQR: {iqr:.2f}")
                 self.log(f"  - 결정 경계: {decision_boundary:.3f}")
                 
                 # 정상 데이터 분포 확인
@@ -1133,12 +1111,11 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
-                    'boundary_method': 'iqr',
+                    'boundary_method': 'percentile_5',
                     'score_transform': transform_info,
-                    'iqr_stats': {
-                        'q1': float(q1),
-                        'q3': float(q3),
-                        'iqr': float(iqr)
+                    'boundary_stats': {
+                        'percentile_5': float(decision_boundary),
+                        'method': 'percentile_based'
                     },
                     'evaluation_skipped': True,
                     'trained_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1185,15 +1162,13 @@ class OCSVMTrainerGUI:
                 self.log(f"✅ 예측 완료 ({eval_time:.1f}초)")
                 
                 # 점수 변환
-                scores_transformed, transform_info = transform_scores(scores)
+                scores_transformed, transform_info = self.transform_scores(scores)
                 
-                # 결정 경계 계산 (IQR 방식)
+                # 결정 경계 계산 (5% 백분위수 방식)
                 self.log("\n결정 경계 계산 중...")
                 
-                # IQR 기반 결정 경계 (라즈베리파이와 동일)
-                q1, q3 = np.percentile(scores_transformed, [25, 75])
-                iqr = q3 - q1
-                decision_boundary = q1 - 3 * iqr
+                # 결정 경계 설정: 정상 데이터의 하위 5%를 경계로
+                decision_boundary = np.percentile(scores_transformed, 5)
                 
                 # 정상 데이터 분포 확인
                 normal_scores_transformed = scores_transformed[scores_transformed > decision_boundary]
@@ -1202,7 +1177,6 @@ class OCSVMTrainerGUI:
                 self.log(f"  - 평균: {normal_scores_transformed.mean():.3f}")
                 self.log(f"  - 중앙값: {np.median(normal_scores_transformed):.3f}")
                 self.log(f"  - 결정 경계: {decision_boundary:.3f}")
-                self.log(f"  - Q1: {q1:.3f}, Q3: {q3:.3f}, IQR: {iqr:.3f}")
                 
                 # 🔍 디버깅: 전체 평가에서도 경계값 확인
                 self.log(f"\n🔍 [디버깅] 전체 평가 Decision Boundary:")
@@ -1407,12 +1381,11 @@ class OCSVMTrainerGUI:
                     'features': self.sensor_config[sensor]['features'],
                     'best_params': self.study.best_params,
                     'decision_boundary': float(decision_boundary),
-                    'boundary_method': 'iqr',
+                    'boundary_method': 'percentile_5',
                     'score_transform': transform_info,
-                    'iqr_stats': {
-                        'q1': float(q1),
-                        'q3': float(q3),
-                        'iqr': float(iqr)
+                    'boundary_stats': {
+                        'percentile_5': float(decision_boundary),
+                        'method': 'percentile_based'
                     },
                     'anomaly_ratio': float(anomaly_ratio),
                     'score_statistics': {
@@ -1494,9 +1467,7 @@ class OCSVMTrainerGUI:
             test_scores = test_model.score_samples(test_scaled)
             
             # 점수 변환 테스트
-            test_transform_info = model_info['score_transform']
-            test_transformed = test_transform_info['transform_a'] * test_scores + test_transform_info['transform_b']
-            test_transformed = np.clip(test_transformed, -17, 1)
+            test_transformed, _ = self.transform_scores(test_scores)
             
             self.log(f"  - 테스트 변환: 원본 [{test_data.min():.2f}, {test_data.max():.2f}] → "
                     f"스케일 [{test_scaled.min():.2f}, {test_scaled.max():.2f}]")
@@ -1586,9 +1557,9 @@ class OCSVMTrainerGUI:
             start_date = self.test_start_date.get_date()
             end_date = self.test_end_date.get_date()
             
-            # 최대 30일 제한
-            if (end_date - start_date).days > 30:
-                messagebox.showerror("오류", "테스트 기간은 최대 30일까지만 가능합니다.")
+            # 최대 5일 제한
+            if (end_date - start_date).days > 5:
+                messagebox.showerror("오류", "테스트 기간은 최대 5일까지만 가능합니다.")
                 return
             
             if start_date > end_date:
@@ -1600,97 +1571,56 @@ class OCSVMTrainerGUI:
             
             # 결과 텍스트 초기화
             self.result_text.delete(1.0, tk.END)
-            self.result_text.insert(tk.END, f"모델 테스트 결과\n")
+            self.result_text.insert(tk.END, f"Model Test Results\n")
             self.result_text.insert(tk.END, f"{'='*60}\n")
-            self.result_text.insert(tk.END, f"머신: {machine_id}, 센서: {sensor}\n")
-            self.result_text.insert(tk.END, f"테이블: {table_name}\n")
-            self.result_text.insert(tk.END, f"기간: {start_date} ~ {end_date}\n")
-            self.result_text.insert(tk.END, f"샘플링: {self.sampling_info_var.get()}\n")
-            self.result_text.insert(tk.END, f"결정 경계: {model_info.get('decision_boundary', 'N/A')}\n\n")
+            self.result_text.insert(tk.END, f"Machine: {machine_id}, Sensor: {sensor}\n")
+            self.result_text.insert(tk.END, f"Table: {table_name}\n")
+            self.result_text.insert(tk.END, f"Period: {start_date} ~ {end_date}\n")
+            self.result_text.insert(tk.END, f"Sampling: {self.sampling_info_var.get()}\n")
+            self.result_text.insert(tk.END, f"Decision Boundary: {model_info.get('decision_boundary', 'N/A')}\n\n")
             
-            # 전체 기간 데이터 수집
-            self.log(f"테스트 데이터 추출 중: {start_date} ~ {end_date}")
+            # 전체 기간 데이터를 한 번에 가져오기
+            self.log(f"Extracting test data: {start_date} ~ {end_date}")
             
-            # 날짜별로 데이터 수집
-            all_timestamps = []
-            all_scores = []
+            # 전체 기간 데이터 추출 (한 번에)
+            start_str = start_date.strftime("%Y-%m-%d")
+            end_str = end_date.strftime("%Y-%m-%d")
             
-            current_date = start_date
-            while current_date <= end_date:
-                date_str = current_date.strftime("%Y-%m-%d")
-                self.result_text.insert(tk.END, f"\n[{date_str}] 처리 중...")
-                self.root.update_idletasks()
-                
-                # 테스트 데이터 추출 (라즈베리파이와 동일한 방식)
-                test_data = self.get_training_data(
-                    machine_id, sensor,
-                    f"{date_str} 00:00:00",
-                    f"{date_str} 23:59:59"
-                )
-                
-                if test_data is None or len(test_data) == 0:
-                    self.result_text.insert(tk.END, " 데이터 없음\n")
-                    current_date += timedelta(days=1)
-                    continue
-                
-                # 예측
-                # 테스트 데이터 스케일링
-                X_test_scaled = scaler.transform(test_data)
-                
-                self.log(f"✅ 테스트 데이터 정규화 완료: {X_test_scaled.shape}")
-                
-                # 🔍 디버깅: 테스트 데이터 스케일 확인
-                self.log(f"\n🔍 [디버깅] 테스트 데이터 분석:")
-                self.log(f"  - 원본 데이터 범위: [{test_data.min():.2f}, {test_data.max():.2f}]")
-                self.log(f"  - 스케일 후 범위: [{X_test_scaled.min():.2f}, {X_test_scaled.max():.2f}]")
-                self.log(f"  - 스케일 후 평균: {X_test_scaled.mean():.4f}")
-                self.log(f"  - 스케일 후 표준편차: {X_test_scaled.std():.4f}")
-                
-                # 각 특징별 분포
-                for i, feature_name in enumerate(self.sensor_config[sensor]['features']):
-                    self.log(f"  [{feature_name}]")
-                    self.log(f"    원본: mean={test_data[:, i].mean():.2f}, std={test_data[:, i].std():.2f}")
-                    self.log(f"    스케일: mean={X_test_scaled[:, i].mean():.2f}, std={X_test_scaled[:, i].std():.2f}")
-                
-                # 모델 정보
-                self.log(f"\n🔍 [디버깅] 모델 정보:")
-                self.log(f"  - 모델 타입: {type(model).__name__}")
-                
-                # 예측
-                self.log("모델 예측 수행 중...")
-                predictions = model.predict(X_test_scaled)
-                scores = model.score_samples(X_test_scaled)
-                
-                # 점수 변환 (모델 정보에 변환 정보가 있는 경우)
-                if model_info.get('score_transform'):
-                    transform_info = model_info['score_transform']
-                    scores_transformed = transform_info['transform_a'] * scores + transform_info['transform_b']
-                    scores_transformed = np.clip(scores_transformed, -17, 1)
-                else:
-                    # 변환 정보가 없으면 간단한 선형 변환
-                    min_score = np.min(scores)
-                    max_score = np.max(scores)
-                    scores_transformed = -17 + (scores - min_score) * 18 / (max_score - min_score)
-                
-                self.log(f"✅ 예측 완료:")
-                self.log(f"  - 원본 점수 범위: [{scores.min():.4f}, {scores.max():.4f}]")
-                self.log(f"  - 변환 점수 범위: [{scores_transformed.min():.2f}, {scores_transformed.max():.2f}]")
-                
-                # 5초 윈도우로 타임스탬프 생성
-                window_sec = self.sensor_config[sensor]['window_sec']
-                timestamps = [datetime.strptime(f"{date_str} 00:00:00", "%Y-%m-%d %H:%M:%S") + 
-                            timedelta(seconds=i*window_sec) for i in range(len(scores))]
-                
-                all_timestamps.extend(timestamps)
-                all_scores.extend(scores_transformed)
-                
-                # 결과 분석
-                anomaly_count = np.sum(predictions == -1)
-                anomaly_ratio = anomaly_count / len(predictions) * 100
-                
-                self.result_text.insert(tk.END, f" 완료 (이상: {anomaly_count}/{len(predictions)}, {anomaly_ratio:.1f}%)\n")
-                
-                current_date += timedelta(days=1)
+            # get_training_data 함수 사용 (전체 기간)
+            test_features, test_timestamps = self.get_training_data(machine_id, sensor, start_str, end_str, "00:00", "23:59", return_timestamps=True)
+            
+            if test_features is None or len(test_features) == 0:
+                self.result_text.insert(tk.END, "No data found for the selected period.\n")
+                self.log("No test data found")
+                return
+            
+            self.result_text.insert(tk.END, f"Processing {len(test_features)} windows...\n")
+            self.root.update_idletasks()
+            
+            # 스케일링
+            X_test_scaled = scaler.transform(test_features)
+            self.log(f"✅ Test data normalized: {X_test_scaled.shape}")
+            
+            # 예측
+            self.log("Running model predictions...")
+            predictions = model.predict(X_test_scaled)
+            scores = model.score_samples(X_test_scaled)
+            
+            # 점수 변환
+            if model_info.get('score_transform'):
+                scores_transformed, _ = self.transform_scores(scores)
+            else:
+                min_score = np.min(scores)
+                max_score = np.max(scores)
+                scores_transformed = -10 + (scores - min_score) * 20 / (max_score - min_score)
+            
+            self.log(f"✅ Prediction complete:")
+            self.log(f"  - Original score range: [{scores.min():.4f}, {scores.max():.4f}]")
+            self.log(f"  - Transformed score range: [{scores_transformed.min():.2f}, {scores_transformed.max():.2f}]")
+            
+            # 실제 타임스탬프 사용
+            all_timestamps = pd.to_datetime(test_timestamps)
+            all_scores = scores_transformed
             
             # 플롯 그리기
             self.plot_test_results(all_timestamps, all_scores, sensor, model_info)
@@ -1698,15 +1628,29 @@ class OCSVMTrainerGUI:
             # 전체 결과 요약
             if all_scores:
                 all_scores = np.array(all_scores)
-                total_anomalies = np.sum(all_scores < model_info.get('decision_boundary', 0))
+                decision_boundary_value = float(model_info.get('decision_boundary', 0))
+                total_anomalies = np.sum(all_scores < decision_boundary_value)
                 total_ratio = total_anomalies / len(all_scores) * 100
                 
                 self.result_text.insert(tk.END, f"\n{'='*60}\n")
-                self.result_text.insert(tk.END, f"전체 결과 요약\n")
-                self.result_text.insert(tk.END, f"총 윈도우 수: {len(all_scores):,}\n")
-                self.result_text.insert(tk.END, f"이상 탐지: {total_anomalies:,}개 ({total_ratio:.2f}%)\n")
-                self.result_text.insert(tk.END, f"점수 범위: [{np.min(all_scores):.2f}, {np.max(all_scores):.2f}]\n")
-                self.result_text.insert(tk.END, f"평균 점수: {np.mean(all_scores):.2f} ± {np.std(all_scores):.2f}\n")
+                self.result_text.insert(tk.END, f"Overall Summary\n")
+                self.result_text.insert(tk.END, f"Total windows: {len(all_scores):,}\n")
+                self.result_text.insert(tk.END, f"Anomalies detected: {total_anomalies:,} ({total_ratio:.2f}%)\n")
+                self.result_text.insert(tk.END, f"Score range: [{np.min(all_scores):.2f}, {np.max(all_scores):.2f}]\n")
+                self.result_text.insert(tk.END, f"Average score: {np.mean(all_scores):.2f} ± {np.std(all_scores):.2f}\n")
+                
+                # 날짜별 통계 추가
+                df_results = pd.DataFrame({'timestamp': all_timestamps, 'score': all_scores})
+                df_results['date'] = df_results['timestamp'].dt.date
+                daily_stats = df_results.groupby('date')['score'].agg(['count', 'mean', 'std'])
+                
+                self.result_text.insert(tk.END, f"\nDaily Statistics:\n")
+                for date, stats in daily_stats.iterrows():
+                    # 날짜별 데이터 필터링
+                    date_data = df_results[df_results['date'] == date]
+                    date_scores = date_data['score'].values
+                    anomaly_count = np.sum(date_scores < decision_boundary_value)
+                    self.result_text.insert(tk.END, f"  {date}: {stats['count']} windows, {anomaly_count} anomalies, avg score: {stats['mean']:.2f}\n")
             
         except Exception as e:
             messagebox.showerror("오류", f"테스트 중 오류 발생: {e}")
@@ -1721,9 +1665,16 @@ class OCSVMTrainerGUI:
             
             # numpy 배열로 변환
             scores = np.array(scores)
-            decision_boundary = model_info.get('decision_boundary', 0)
+            timestamps = pd.to_datetime(timestamps)
+            decision_boundary = float(model_info.get('decision_boundary', 0))  # float으로 변환
             
-            # 1. Score 플롯
+            # 데이터가 없는 경우 처리
+            if len(scores) == 0:
+                self.ax1.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=self.ax1.transAxes)
+                self.ax2.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=self.ax2.transAxes)
+                return
+            
+            # 1. Score 플롯 (개선된 X축)
             self.ax1.plot(timestamps, scores, 'b-', linewidth=0.5, alpha=0.7, label='Score')
             self.ax1.axhline(y=decision_boundary, color='r', linestyle='--', linewidth=2, 
                             label=f'Decision Boundary ({decision_boundary:.2f})')
@@ -1732,37 +1683,136 @@ class OCSVMTrainerGUI:
             # 이상 구간 표시
             anomaly_mask = scores < decision_boundary
             if np.any(anomaly_mask):
-                self.ax1.scatter(np.array(timestamps)[anomaly_mask],
+                self.ax1.scatter(timestamps[anomaly_mask],
                                scores[anomaly_mask],
                                color='red', s=10, alpha=0.5, label='Anomaly')
             
-            self.ax1.set_ylabel(f'{sensor.upper()} Score', fontsize=12)
+            self.ax1.set_ylabel('Score', fontsize=12)
             self.ax1.set_title(f'{self.test_machine_var.get()} - {sensor.upper()} Anomaly Detection Results', fontsize=14)
             self.ax1.legend(loc='upper right')
             self.ax1.grid(True, alpha=0.3)
             
-            # 2. 이상 빈도 히스토그램 (시간별)
-            # 1시간 단위로 이상 개수 집계
-            hour_bins = pd.date_range(start=min(timestamps), end=max(timestamps), freq='H')
-            hour_counts = []
+            # X축 포맷 개선
+            # 날짜 범위에 따라 적절한 포맷 선택
+            date_range = (timestamps[-1] - timestamps[0]).days
             
-            for i in range(len(hour_bins)-1):
-                mask = (np.array(timestamps) >= hour_bins[i]) & (np.array(timestamps) < hour_bins[i+1])
-                hour_anomalies = np.sum(scores[mask] < decision_boundary) if np.any(mask) else 0
-                hour_counts.append(hour_anomalies)
+            if date_range == 0:  # 같은 날
+                # 시간 범위 확인
+                time_range_hours = (timestamps[-1] - timestamps[0]).total_seconds() / 3600
+                
+                if time_range_hours <= 6:  # 6시간 이하
+                    self.ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+                    self.ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+                    self.ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=10))
+                elif time_range_hours <= 12:  # 12시간 이하
+                    self.ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                    self.ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+                    self.ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=30))
+                else:  # 하루 전체
+                    self.ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                    self.ax1.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+                    self.ax1.xaxis.set_minor_locator(mdates.HourLocator(interval=1))
+            elif date_range <= 3:  # 3일 이하
+                self.ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+                self.ax1.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            elif date_range <= 7:  # 1주일 이하
+                self.ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+                self.ax1.xaxis.set_major_locator(mdates.HourLocator(interval=12))
             
-            self.ax2.bar(hour_bins[:-1], hour_counts, width=1/24, alpha=0.7, color='red')
-            self.ax2.set_ylabel('Anomalies per Hour', fontsize=12)
-            self.ax2.set_xlabel('Time', fontsize=12)
-            self.ax2.grid(True, alpha=0.3)
+            plt.setp(self.ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
             
-            # X축 포맷팅
-            self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %Hh'))
-            self.ax2.xaxis.set_major_locator(mdates.HourLocator(interval=6))
-            plt.setp(self.ax2.xaxis.get_majorticklabels(), rotation=45)
+            # 2. 날짜별 이상치 비율 막대 그래프
+            # DataFrame 생성
+            df = pd.DataFrame({
+                'timestamp': timestamps,
+                'score': scores,
+                'is_anomaly': anomaly_mask
+            })
+            df['date'] = df['timestamp'].dt.date
+            df['hour'] = df['timestamp'].dt.hour
+            
+            # 날짜별 이상치 비율 계산
+            daily_stats = df.groupby('date').agg({
+                'is_anomaly': ['sum', 'count']
+            })
+            daily_stats.columns = ['anomaly_count', 'total_count']
+            daily_stats['anomaly_ratio'] = daily_stats['anomaly_count'] / daily_stats['total_count'] * 100
+            
+            # 막대 그래프
+            dates = daily_stats.index
+            ratios = daily_stats['anomaly_ratio'].values
+            
+            # dates를 matplotlib이 이해할 수 있는 형식으로 변환
+            if len(dates) > 0:
+                # pandas date를 datetime으로 변환
+                dates_for_plot = [pd.to_datetime(d) for d in dates]
+                bars = self.ax2.bar(dates_for_plot, ratios, alpha=0.7, color='red')
+            else:
+                bars = []
+            
+            # 데이터가 없는 날짜 처리
+            if len(bars) == 0:
+                self.ax2.text(0.5, 0.5, 'No anomalies detected', ha='center', va='center', transform=self.ax2.transAxes)
+                self.fig.tight_layout()
+                self.canvas.draw()
+                return
+            
+            # 값 레이블 추가 (막대 위에)
+            for bar, ratio in zip(bars, ratios):
+                if ratio > 0:
+                    height = bar.get_height()
+                    self.ax2.text(bar.get_x() + bar.get_width()/2., height,
+                                f'{ratio:.1f}%',
+                                ha='center', va='bottom', fontsize=8)
+            
+            self.ax2.set_ylabel('Daily Anomaly Ratio (%)', fontsize=12)
+            self.ax2.set_xlabel('Date', fontsize=12)
+            self.ax2.grid(True, alpha=0.3, axis='y')
+            
+            # X축 포맷
+            if len(dates) <= 7:
+                self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+                self.ax2.xaxis.set_major_locator(mdates.DayLocator())
+            else:
+                self.ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+                self.ax2.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(dates)//10)))
+            
+            plt.setp(self.ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # 평균선 추가
+            mean_ratio = daily_stats['anomaly_ratio'].mean()
+            self.ax2.axhline(y=mean_ratio, color='orange', linestyle=':', linewidth=2, 
+                            label=f'Average: {mean_ratio:.1f}%')
+            self.ax2.legend()
             
             self.fig.tight_layout()
             self.canvas.draw()
+            
+            # 추가 정보를 결과 텍스트에 출력
+            self.result_text.insert(tk.END, f"\n\n📊 Hourly Anomaly Analysis:\n")
+            
+            # 시간대별 통계
+            hourly_stats = df.groupby('hour')['is_anomaly'].agg(['sum', 'count'])
+            hourly_stats['ratio'] = hourly_stats['sum'] / hourly_stats['count'] * 100
+            
+            self.result_text.insert(tk.END, f"\nAverage anomaly ratio by hour:\n")
+            for hour in range(24):
+                if hour in hourly_stats.index:
+                    ratio = hourly_stats.loc[hour, 'ratio']
+                    count = hourly_stats.loc[hour, 'count']
+                    if ratio > 0:
+                        self.result_text.insert(tk.END, f"  {hour:02d}:00: {ratio:5.1f}% (n={count})\n")
+            
+            # 실제 데이터 간격 정보 추가
+            if len(timestamps) > 1:
+                time_diffs = np.diff(timestamps.values).astype('timedelta64[s]').astype(float)
+                avg_interval = np.mean(time_diffs)
+                std_interval = np.std(time_diffs)
+                
+                self.result_text.insert(tk.END, f"\n📊 Data Collection Interval:\n")
+                self.result_text.insert(tk.END, f"  Average: {avg_interval:.1f} seconds\n")
+                self.result_text.insert(tk.END, f"  Std Dev: {std_interval:.1f} seconds\n")
+                self.result_text.insert(tk.END, f"  Range: [{np.min(time_diffs):.1f}, {np.max(time_diffs):.1f}] seconds\n")
             
         except Exception as e:
             self.log(f"플롯 생성 오류: {e}")
@@ -1837,6 +1887,46 @@ class OCSVMTrainerGUI:
         except Exception as e:
             self.log(f"시간대별 분석 오류: {e}")
             return None
+    
+    def transform_scores(self, scores):
+        """Isolation Forest 점수를 자연스러운 이상 점수로 변환"""
+        # Isolation Forest 점수 특성:
+        # - 0에 가까울수록 정상
+        # - 음수일수록 이상
+        # - 일반적으로 -0.1 ~ -0.7 범위
+        
+        # 중앙값을 기준점으로 사용
+        median_score = np.median(scores)
+        
+        # 비선형 변환 함수 (지수 함수 기반)
+        def exponential_transform(x):
+            # 중앙값 기준으로 정규화
+            normalized = (x - median_score) / abs(median_score) if median_score != 0 else x
+            
+            # 지수 변환으로 자연스러운 분포 생성
+            if normalized >= 0:
+                # 정상 범위: 0 근처 유지
+                return normalized * 2  # 최대 +2 정도
+            else:
+                # 이상 범위: 지수적으로 증가
+                # normalized가 -1일 때 약 -7
+                # normalized가 -2일 때 약 -15
+                # normalized가 -3일 때 약 -25
+                return 5 * (np.exp(abs(normalized)) - 1) * np.sign(normalized)
+        
+        # 벡터화된 변환 적용
+        transformed = np.vectorize(exponential_transform)(scores)
+        
+        # 클리핑 없음 - 자연스러운 값 그대로 사용
+        
+        # 통계 정보
+        stats = {
+            'median_score': float(median_score),
+            'original_range': [float(np.min(scores)), float(np.max(scores))],
+            'transformed_range': [float(np.min(transformed)), float(np.max(transformed))]
+        }
+        
+        return transformed, stats
     
     def start_testing(self):
         start_date = self.test_start_date.get_date()
